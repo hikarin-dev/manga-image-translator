@@ -11,9 +11,13 @@ import os
 import shutil
 from torch import Tensor
 
+import time
+
 from .common import OfflineInpainter
 from ..config import InpainterConfig
 from ..utils import resize_keep_aspect
+from ..utils.executors import run_cpu, submit_gpu
+from ..utils.profiling import add_substage
 
 
 TORCH_DTYPE_MAP = {
@@ -53,69 +57,94 @@ class LamaMPEInpainter(OfflineInpainter):
     async def _unload(self):
         del self.model
 
+    # _infer orchestrates its own placement: full-page copies/resizes/tensor prep (pre)
+    # and the resize-back + composite (post) run on the CPU pool; only H2D + the forward
+    # + D2H run on the GPU thread. Same math in the same order — output identical.
+    _SELF_ORCHESTRATED = True
+    # Lane 1: inpaint kernels overlap the OCR beam loop's host gaps on lane 0.
+    _GPU_LANE = 1
+
     async def _infer(self, image: np.ndarray, mask: np.ndarray, config: InpainterConfig, inpainting_size: int = 1024, verbose: bool = False) -> np.ndarray:
-        img_original = np.copy(image)
-        mask_original = np.copy(mask)
-        mask_original[mask_original < 127] = 0
-        mask_original[mask_original >= 127] = 1
-        mask_original = mask_original[:, :, None]
+        def _pre():
+            t0 = time.perf_counter()
+            img_original = np.copy(image)
+            mask_original = np.copy(mask)
+            mask_original[mask_original < 127] = 0
+            mask_original[mask_original >= 127] = 1
+            mask_original = mask_original[:, :, None]
 
-        height, width, c = image.shape
-        if max(image.shape[0: 2]) > inpainting_size:
-            image = resize_keep_aspect(image, inpainting_size)
-            mask = resize_keep_aspect(mask, inpainting_size)
-        pad_size = 8
-        h, w, c = image.shape
-        if h % pad_size != 0:
-            new_h = (pad_size - (h % pad_size)) + h
-        else:
-            new_h = h
-        if w % pad_size != 0:
-            new_w = (pad_size - (w % pad_size)) + w
-        else:
-            new_w = w
-        if new_h != h or new_w != w:
-            image = cv2.resize(image, (new_w, new_h), interpolation = cv2.INTER_LINEAR)
-            mask = cv2.resize(mask, (new_w, new_h), interpolation = cv2.INTER_LINEAR)
-        self.logger.info(f'Inpainting resolution: {new_w}x{new_h}')
-        if isinstance(self.model, LamaFourier):
-            img_torch = torch.from_numpy(image).permute(2, 0, 1).unsqueeze_(0).float() / 255.
-        else:
-            img_torch = torch.from_numpy(image).permute(2, 0, 1).unsqueeze_(0).float() / 127.5 - 1.0
-        mask_torch = torch.from_numpy(mask).unsqueeze_(0).unsqueeze_(0).float() / 255.0
-        mask_torch[mask_torch < 0.5] = 0
-        mask_torch[mask_torch >= 0.5] = 1
-        if self.device.startswith('cuda') or self.device == 'mps':
-            img_torch = img_torch.to(self.device)
-            mask_torch = mask_torch.to(self.device)
-        with torch.no_grad():
-            img_torch *= (1 - mask_torch)
-            if not (self.device.startswith('cuda')):
-                # mps devices here
-                img_inpainted_torch = self.model(img_torch, mask_torch)
+            height, width, c = image.shape
+            img, msk = image, mask
+            if max(img.shape[0: 2]) > inpainting_size:
+                img = resize_keep_aspect(img, inpainting_size)
+                msk = resize_keep_aspect(msk, inpainting_size)
+            pad_size = 8
+            h, w, c = img.shape
+            if h % pad_size != 0:
+                new_h = (pad_size - (h % pad_size)) + h
             else:
-                # Note: lama's weight shouldn't be convert to fp16 or bf16 otherwise it produces darkened results.
-                # but it can inference under torch.autocast
+                new_h = h
+            if w % pad_size != 0:
+                new_w = (pad_size - (w % pad_size)) + w
+            else:
+                new_w = w
+            if new_h != h or new_w != w:
+                img = cv2.resize(img, (new_w, new_h), interpolation = cv2.INTER_LINEAR)
+                msk = cv2.resize(msk, (new_w, new_h), interpolation = cv2.INTER_LINEAR)
+            if isinstance(self.model, LamaFourier):
+                img_torch = torch.from_numpy(img).permute(2, 0, 1).unsqueeze_(0).float() / 255.
+            else:
+                img_torch = torch.from_numpy(img).permute(2, 0, 1).unsqueeze_(0).float() / 127.5 - 1.0
+            mask_torch = torch.from_numpy(msk).unsqueeze_(0).unsqueeze_(0).float() / 255.0
+            mask_torch[mask_torch < 0.5] = 0
+            mask_torch[mask_torch >= 0.5] = 1
+            add_substage('inp_pre', time.perf_counter() - t0)
+            return img_torch, mask_torch, img_original, mask_original, (height, width), (new_h, new_w)
 
-                precision = TORCH_DTYPE_MAP[str(config.inpainting_precision)]
-                
-                if precision == torch.float16:
-                    precision = torch.bfloat16
-                    self.logger.warning('Switch to bf16 due to Lama only compatible with bf16 and fp32.')
+        img_torch, mask_torch, img_original, mask_original, (height, width), (new_h, new_w) = await run_cpu(_pre)
+        self.logger.debug(f'Inpainting resolution: {new_w}x{new_h}')
 
-                with torch.autocast(device_type="cuda", dtype=precision):
+        async def _fwd(img_torch=img_torch, mask_torch=mask_torch):
+            t0 = time.perf_counter()
+            if self.device.startswith('cuda') or self.device == 'mps':
+                img_torch = img_torch.to(self.device)
+                mask_torch = mask_torch.to(self.device)
+            with torch.no_grad():
+                img_torch *= (1 - mask_torch)
+                if not (self.device.startswith('cuda')):
+                    # mps devices here
                     img_inpainted_torch = self.model(img_torch, mask_torch)
+                else:
+                    # Note: lama's weight shouldn't be convert to fp16 or bf16 otherwise it produces darkened results.
+                    # but it can inference under torch.autocast
 
-        if isinstance(self.model, LamaFourier):
-            img_inpainted_torch = img_inpainted_torch.to(torch.float32)
-            img_inpainted = (img_inpainted_torch.cpu().squeeze_(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
-        else:
-            img_inpainted_torch = img_inpainted_torch.to(torch.float32)
-            img_inpainted = ((img_inpainted_torch.cpu().squeeze_(0).permute(1, 2, 0).numpy() + 1.0) * 127.5).astype(np.uint8)
-        if new_h != height or new_w != width:
-            img_inpainted = cv2.resize(img_inpainted, (width, height), interpolation = cv2.INTER_LINEAR)
-        ans = img_inpainted * mask_original + img_original * (1 - mask_original)
-        return ans
+                    precision = TORCH_DTYPE_MAP[str(config.inpainting_precision)]
+
+                    if precision == torch.float16:
+                        precision = torch.bfloat16
+                        self.logger.warning('Switch to bf16 due to Lama only compatible with bf16 and fp32.')
+
+                    with torch.autocast(device_type="cuda", dtype=precision):
+                        img_inpainted_torch = self.model(img_torch, mask_torch)
+            out = img_inpainted_torch.to(torch.float32).cpu()
+            add_substage('inp_gpu', time.perf_counter() - t0)
+            return out
+
+        img_inpainted_torch = await submit_gpu(_fwd(), self._GPU_LANE)
+
+        def _post():
+            t0 = time.perf_counter()
+            if isinstance(self.model, LamaFourier):
+                img_inpainted = (img_inpainted_torch.squeeze_(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
+            else:
+                img_inpainted = ((img_inpainted_torch.squeeze_(0).permute(1, 2, 0).numpy() + 1.0) * 127.5).astype(np.uint8)
+            if new_h != height or new_w != width:
+                img_inpainted = cv2.resize(img_inpainted, (width, height), interpolation = cv2.INTER_LINEAR)
+            ans = img_inpainted * mask_original + img_original * (1 - mask_original)
+            add_substage('inp_post', time.perf_counter() - t0)
+            return ans
+
+        return await run_cpu(_post)
     
 
 class LamaLargeInpainter(LamaMPEInpainter):

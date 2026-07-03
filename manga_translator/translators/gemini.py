@@ -326,6 +326,7 @@ class GeminiTranslator(CommonGPTTranslator):
 
             # Assemble prompt for the current batch  
             prompt, query_size = self._assemble_prompts(from_lang, to_lang, prompt_queries).__next__()
+            server_error_attempt = 0  # count API errors (e.g. 429 rate-limit) — was used uninitialized
 
             for attempt in range(RETRY_ATTEMPTS):  
                 try:  
@@ -375,10 +376,12 @@ class GeminiTranslator(CommonGPTTranslator):
                     server_error_attempt += 1
                     if server_error_attempt >= self._RETRY_ATTEMPTS:
                         self.logger.error(
-                            'Gemini encountered a server error, possibly due to high server load. Use a different translator or try again later.')
+                            'Gemini API error after retries (free-tier rate limit or server load). '
+                            'Try a model with a higher free limit (a flash-lite) or another translator.')
                         raise
-                    self.logger.warning(f'Restarting request due to a server error. Attempt: {server_error_attempt}')
-                    await asyncio.sleep(1)
+                    # Back off long enough to clear a free-tier rate limit (e.g. 5 req/min).
+                    self.logger.warning(f'Gemini API error; retry {server_error_attempt}, waiting 10s...')
+                    await asyncio.sleep(10)
                 except Exception as e:  
                     self.logger.error(f'Error during translation attempt: {e}')  
                     if attempt == RETRY_ATTEMPTS - 1:  
@@ -408,10 +411,17 @@ class GeminiTranslator(CommonGPTTranslator):
                     self.logger.error(f'Query: {queries[idx]}')  
                 return False  # Indicate failure for this batch   
 
-        # Begin translation process  
-        prompt_queries = queries  
-        prompt_query_indices = list(range(len(queries)))  
-        await translate_batch(prompt_queries, prompt_query_indices)  
+        # Begin translation process. Walk the assembler's own token-bounded chunking and
+        # translate EVERY chunk, not just the first. _assemble_prompts splits the queries
+        # when their combined size exceeds _MAX_TOKENS_IN; the previous code took only the
+        # first chunk via .__next__() and silently dropped the rest. Sending each chunk as
+        # its own request keeps all text translated (an extra request only when needed).
+        _start = 0
+        for _prompt, _chunk_size in self._assemble_prompts(from_lang, to_lang, queries):
+            _sub_queries = queries[_start:_start + _chunk_size]
+            _sub_indices = list(range(_start, _start + _chunk_size))
+            await translate_batch(_sub_queries, _sub_indices)
+            _start += _chunk_size
 
         self.logger.debug(translations)  
         if self.token_count_last:  
@@ -479,8 +489,24 @@ class GeminiTranslator(CommonGPTTranslator):
                 self.token_count += response.usage_metadata.prompt_token_count
                 self.token_count_last = response.usage_metadata.total_token_count
             
-            self.logger.debug(f'-- GPT Response --\n' + response.text)
+            if response.text is None:
+                # Gemini returned no text — the content was blocked. This happens regardless of
+                # BLOCK_NONE for content Gemini refuses outright (notably anything it reads as
+                # involving minors). Surface a clear reason instead of crashing on None.
+                reason = 'blocked / empty response'
+                try:
+                    fb = getattr(response, 'prompt_feedback', None)
+                    if fb and getattr(fb, 'block_reason', None):
+                        reason = f'prompt blocked ({fb.block_reason})'
+                    elif getattr(response, 'candidates', None) and response.candidates[0].finish_reason:
+                        reason = f'finish_reason={response.candidates[0].finish_reason}'
+                except Exception:
+                    pass
+                raise InvalidServerResponse(
+                    f'Gemini returned no text — {reason}. Gemini refused this content; '
+                    'use the local Qwen translator for pages like this.')
 
+            self.logger.debug('-- GPT Response --\n' + response.text)
             return response.text
         except Exception as ex:
             self.logger.error(f"Error in _request_translation: {str(ex)}")

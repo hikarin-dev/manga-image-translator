@@ -41,6 +41,8 @@ from .translators import (
 from .translators.common import ISO_639_1_TO_VALID_LANGUAGES
 from .colorization import dispatch as dispatch_colorization, prepare as prepare_colorization, unload as unload_colorization
 from .rendering import dispatch as dispatch_rendering, dispatch_eng_render, dispatch_eng_render_pillow
+from .utils.executors import run_cpu, submit_gpu, prewarm_proc_pool
+from .utils.profiling import Profiler
 
 # Will be overwritten by __main__.py if module is being run directly (with python -m)
 logger = logging.getLogger('manga_translator')
@@ -117,6 +119,8 @@ class MangaTranslator:
         self.batch_size = 1  # 默认不批量处理
 
         self._progress_hooks = []
+        self._page_result_hooks = []
+        self._page_bubbles_hooks = []
         self._add_logger_hook()
 
         params = params or {}
@@ -138,6 +142,7 @@ class MangaTranslator:
         torch.backends.cudnn.allow_tf32 = True
 
         self._model_usage_timestamps = {}
+        self._stage_times = {}  # per-stage wall-clock accumulator (s); reset per gallery run
         self._detector_cleanup_task = None
         self.prep_manual = params.get('prep_manual', None)
         self.context_size = params.get('context_size', 0)
@@ -588,7 +593,12 @@ class MangaTranslator:
                 raise
             else:
                 ctx.img_inpainted = ctx.img_rgb
-        ctx.gimp_mask = np.dstack((cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR), ctx.mask))
+        if getattr(ctx, '_gallery', False):
+            # Only the GIMP save format reads gimp_mask; the gallery path never does, and the
+            # full-page dstack+cvtColor per page is pure loop-blocking waste there.
+            ctx.gimp_mask = None
+        else:
+            ctx.gimp_mask = np.dstack((cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR), ctx.mask))
 
         if self.verbose:
             try:
@@ -682,14 +692,20 @@ class MangaTranslator:
         self._model_usage_timestamps[("upscaling", config.upscale.upscaler)] = current_time
         return (await dispatch_upscaling(config.upscale.upscaler, [ctx.img_colorized], config.upscale.upscale_ratio, self.device))[0]
 
+    def _accum_time(self, stage: str, dt: float):
+        """Accumulate per-stage wall-clock seconds for the current gallery run (Step-0 profiling)."""
+        self._stage_times[stage] = self._stage_times.get(stage, 0.0) + dt
+
     async def _run_detection(self, config: Config, ctx: Context):
         current_time = time.time()
         self._model_usage_timestamps[("detection", config.detector.detector)] = current_time
+        t0 = time.perf_counter()
         result = await dispatch_detection(config.detector.detector, ctx.img_rgb, config.detector.detection_size, config.detector.text_threshold,
                                         config.detector.box_threshold,
                                         config.detector.unclip_ratio, config.detector.det_invert, config.detector.det_gamma_correct, config.detector.det_rotate,
                                         config.detector.det_auto_rotate,
-                                        self.device, self.verbose)        
+                                        self.device, self.verbose)
+        self._accum_time('detection', time.perf_counter() - t0)
         return result
 
     async def _unload_model(self, tool: str, model: str):
@@ -749,7 +765,9 @@ class MangaTranslator:
             os.environ['MANGA_OCR_RESULT_DIR'] = ocr_result_dir
         
         try:
+            t0 = time.perf_counter()
             textlines = await dispatch_ocr(config.ocr.ocr, ctx.img_rgb, ctx.textlines, config.ocr, self.device, self.verbose)
+            self._accum_time('ocr', time.perf_counter() - t0)
         finally:
             # 恢复环境变量
             if old_ocr_dir is not None:
@@ -770,8 +788,10 @@ class MangaTranslator:
     async def _run_textline_merge(self, config: Config, ctx: Context):
         current_time = time.time()
         self._model_usage_timestamps[("textline_merge", "textline_merge")] = current_time
+        t0 = time.perf_counter()
         text_regions = await dispatch_textline_merge(ctx.textlines, ctx.img_rgb.shape[1], ctx.img_rgb.shape[0],
                                                      verbose=self.verbose)
+        self._accum_time('textline_merge', time.perf_counter() - t0)
         for region in text_regions:
             if not hasattr(region, "text_raw"):
                 region.text_raw = region.text      # <- Save the initial OCR results to expand the render detection box. Also, prevent affecting the forbidden translation function.       
@@ -916,6 +936,13 @@ class MangaTranslator:
         
         return text_regions
 
+    def reset_page_context(self):
+        """Clear accumulated cross-page translation context. Call between galleries so one
+        title's dialogue doesn't leak into the next as 'previous pages' reference."""
+        self.all_page_translations = []
+        self._original_page_texts = []
+        return {"ok": True}
+
     def _build_prev_context(self, use_original_text=False, current_page_index=None, batch_index=None, batch_original_texts=None):
         """
         跳过句子数为0的页面，取最近 context_size 个非空页面，拼成：
@@ -1054,6 +1081,64 @@ class MangaTranslator:
             'cpu' if self._gpu_limited_memory else self.device
         )
 
+    async def _run_screened_translation(self, config: Config, texts: list, ctx: Context) -> list:
+        import copy
+        from datetime import datetime
+        from .translators import get_translator
+        screen_key   = Translator(config.translator.content_screen_translator)
+        fallback_key = Translator(config.translator.content_screen_fallback_translator)
+        device = 'cpu' if self._gpu_limited_memory else self.device
+
+        # Step 1: translate everything with the local fallback model first
+        fallback_cfg = copy.deepcopy(config)
+        fallback_cfg.translator.translator = fallback_key
+        fallback_cfg.translator._translator_gen = None
+        fallback_results = await self._dispatch_with_context(fallback_cfg, texts, ctx)
+
+        # Step 2: screen the translated output (English is far easier to classify than raw OCR)
+        screen_translator = get_translator(screen_key)
+        await screen_translator.load(ctx.from_lang, config.translator.target_lang, device)
+        self._model_usage_timestamps[("translation", screen_key)] = time.time()
+        flags = await screen_translator.classify(fallback_results, config.translator.content_screen_prompt)
+        self._model_usage_timestamps[("translation", screen_key)] = time.time()
+
+        n_flagged = sum(flags)
+        logger.info(f'Content screen: {n_flagged}/{len(flags)} bubble(s) flagged as explicit — '
+                    f'sending {len(flags) - n_flagged} clean bubble(s) to primary translator')
+
+        # Step 3: re-translate clean bubbles with the primary (cloud) translator
+        clean_idx = [i for i, f in enumerate(flags) if not f]
+        results = list(fallback_results)  # start from fallback, override clean ones
+
+        if clean_idx:
+            cloud_trans = await self._dispatch_with_context(
+                config, [texts[i] for i in clean_idx], ctx)
+            for i, t in zip(clean_idx, cloud_trans):
+                results[i] = t
+
+        try:
+            lines = [
+                f'Content Screen Log — {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+                f'Primary: {config.translator.translator}  |  '
+                f'Screen model: {config.translator.content_screen_translator}  |  '
+                f'Fallback: {config.translator.content_screen_fallback_translator}',
+                f'Flagged: {n_flagged}/{len(flags)} bubble(s) kept as fallback',
+                '',
+                f'{"#":<4}  {"Label":<8}  {"OCR":<35}  {"Fallback":<35}  Final',
+                '-' * 120,
+            ]
+            for i, (text, flag, fallback, final) in enumerate(
+                    zip(texts, flags, fallback_results, results), 1):
+                label = 'EXPLICIT' if flag else 'clean   '
+                lines.append(
+                    f'{i:<4}  {label}  {text[:35]:<35}  {fallback[:35]:<35}  {final}')
+            with open(self._result_path('content_screen.txt'), 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines) + '\n')
+        except Exception as e:
+            logger.warning(f'Content screen: failed to write log: {e}')
+
+        return results
+
     async def _run_text_translation(self, config: Config, ctx: Context):
         # 检查text_regions是否为None或空
         if not ctx.text_regions:
@@ -1088,12 +1173,16 @@ class MangaTranslator:
         else:  
             # 如果是none翻译器，不需要调用翻译服务，文本已经设置为空  
             # If using none translator, no need to call translation service, text is already set to empty  
-            if config.translator.translator != Translator.none:  
+            if config.translator.translator != Translator.none:
                 # 自动给 ChatGPT 加上下文，其他翻译器不改变
                 # Automatically add context to ChatGPT, no change for other translators
                 texts = [region.text for region in ctx.text_regions]
-                translated_sentences = \
-                    await self._dispatch_with_context(config, texts, ctx)
+                if config.translator.content_screen_enabled:
+                    translated_sentences = \
+                        await self._run_screened_translation(config, texts, ctx)
+                else:
+                    translated_sentences = \
+                        await self._dispatch_with_context(config, texts, ctx)
             else:  
                 # 对于none翻译器，创建一个空翻译列表  
                 # For none translator, create an empty translation list  
@@ -1358,12 +1447,16 @@ class MangaTranslator:
     async def _run_inpainting(self, config: Config, ctx: Context):
         current_time = time.time()
         self._model_usage_timestamps[("inpainting", config.inpainter.inpainter)] = current_time
-        return await dispatch_inpainting(config.inpainter.inpainter, ctx.img_rgb, ctx.mask, config.inpainter, config.inpainter.inpainting_size, self.device,
+        t0 = time.perf_counter()
+        result = await dispatch_inpainting(config.inpainter.inpainter, ctx.img_rgb, ctx.mask, config.inpainter, config.inpainter.inpainting_size, self.device,
                                          self.verbose)
+        self._accum_time('inpainting', time.perf_counter() - t0)
+        return result
 
     async def _run_text_rendering(self, config: Config, ctx: Context):
         current_time = time.time()
         self._model_usage_timestamps[("rendering", config.render.renderer)] = current_time
+        t0 = time.perf_counter()
         if config.render.renderer == Renderer.none:
             output = ctx.img_inpainted
         # manga2eng currently only supports horizontal left to right rendering
@@ -1371,11 +1464,18 @@ class MangaTranslator:
             if config.render.renderer == Renderer.manga2EngPillow:
                 output = await dispatch_eng_render_pillow(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing)
             else:
-                output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing)
+                try:
+                    output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing)
+                except Exception as e:
+                    # Freetype path failed (e.g. a face/glyph fault on this page) — retry the page
+                    # with the Pillow renderer before giving up; a second failure raises as before.
+                    logger.warning(f'manga2eng freetype rendering failed ({e}); retrying page with the Pillow renderer')
+                    output = await dispatch_eng_render_pillow(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing)
         else:
             output = await dispatch_rendering(ctx.img_inpainted, ctx.text_regions, self.font_path, config.render.font_size,
                                               config.render.font_size_offset,
                                               config.render.font_size_minimum, not config.render.no_hyphenation, ctx.render_mask, config.render.line_spacing)
+        self._accum_time('rendering', time.perf_counter() - t0)
         return output
 
     def _result_path(self, path: str) -> str:
@@ -1420,6 +1520,230 @@ class MangaTranslator:
     async def _report_progress(self, state: str, finished: bool = False):
         for ph in self._progress_hooks:
             await ph(state, finished)
+
+    def add_page_result_hook(self, ph):
+        self._page_result_hooks.append(ph)
+
+    async def _emit_page_result(self, index: int, image):
+        """Emit a single finished page during a streaming batch translation.
+        No-op unless a page-result hook is registered (e.g. by the share server),
+        so the CLI batch path is unaffected."""
+        for ph in self._page_result_hooks:
+            await ph(index, image)
+
+    def add_page_bubbles_hook(self, ph):
+        self._page_bubbles_hooks.append(ph)
+
+    async def _emit_page_bubbles(self, index: int, bubbles: list):
+        """Emit one page's per-bubble translation overlays during a streaming gallery
+        translation. No-op unless a bubbles hook is registered, so every other path
+        (CLI, single-image, batch) is unaffected."""
+        for ph in self._page_bubbles_hooks:
+            await ph(index, bubbles)
+
+    async def _build_bubble_overlays(self, ctx, config, mode: str = 'text_and_image') -> dict:
+        """Build a page's study payload so a reader can reveal one translated bubble at a time
+        over the clean original, satisfying: precise OCR border, uncropped & isolated text,
+        page-sized (zoom-stable) layers, and overlap-safe stacking.
+
+        `mode` (config.study_mode_generation, never 'disabled' here):
+          • text_only      — metadata only: per-bubble geometry + original/translated text +
+                             renderer style hints. No image layers, no diff, near-zero cost.
+          • text_and_image — metadata plus the image layers:
+              · bg   — the full inpainted page (text removed), shared by every bubble.
+              · text — per bubble, a FULL-PAGE transparent PNG holding ONLY its glyphs.
+
+        Every bubble carries:
+          · box    — the OCR detection region (the hover/click border), normalized.
+          · rbox   — the box the renderer actually laid this region's text in
+                     (manga2eng's enlarged_xyxy; falls back to the detection box).
+          · region — union(box, rbox or glyph extent); clips bg so the background covers
+                     the Japanese AND the full English.
+          · tr/src — translated / original text.
+          · style  — renderer-derived hints (fontSize px, fg/bg rgb, align, dir, lineSpacing)
+                     so a reader can render the bubble as DOM text.
+
+        For text_and_image the glyphs are lifted out of the SINGLE final render
+        (ctx.img_rendered = inpaint + every region's text drawn together) by PARTITIONING
+        every changed pixel among the bubbles (see _build_page_layers): reassembling all
+        bubble layers over the inpaint reproduces the final page pixel-for-pixel — no
+        cropping, no bleed, no double-draw. The whole page (diff, ownership, per-bubble
+        layers, encodes) runs as ONE CPU-pool job instead of one per bubble.
+        Returns None when there's nothing to show."""
+        import io as _io
+        import base64
+
+        inpainted = getattr(ctx, 'img_inpainted', None)
+        rendered = getattr(ctx, 'img_rendered', None)
+        regions = getattr(ctx, 'text_regions', None)
+        if rendered is None or not regions:
+            return None
+        H, W = rendered.shape[:2]
+
+        _is_m2e = config.render.renderer in (Renderer.manga2Eng, Renderer.manga2EngPillow)
+
+        def _style_hints(r):
+            """Best-effort renderer/OCR style metadata for DOM-text study rendering."""
+            hints = {}
+            try:
+                # Prefer the size the renderer actually DREW (post fit-downscale) over the
+                # pre-layout detection size — this is what makes DOM text match the image.
+                fs = int(getattr(r, '_drawn_font_size', 0) or getattr(r, 'font_size', 0) or 0)
+                if fs > 0:
+                    hints['fontSize'] = fs
+            except Exception:
+                pass
+            if _is_m2e:
+                # manga2eng letters in comic caps with a tight line advance (~0.8×size) and a
+                # white border — hint it so DOM text can mimic the typesetting.
+                hints['caps'] = True
+            try:
+                fg, bg = r.get_font_colors()
+                hints['fg'] = [int(c) for c in np.clip(np.asarray(fg), 0, 255)]
+                hints['bg'] = [int(c) for c in np.clip(np.asarray(bg), 0, 255)]
+            except Exception:
+                pass
+            for key, attr in (('align', 'alignment'), ('dir', 'direction')):
+                try:
+                    v = getattr(r, attr, None)
+                    if isinstance(v, str):
+                        hints[key] = v
+                except Exception:
+                    pass
+            try:
+                ls = getattr(r, 'line_spacing', None)
+                if ls:
+                    hints['lineSpacing'] = float(ls)
+            except Exception:
+                pass
+            return hints
+
+        # Per-region geometry + text + style, gathered once for both modes. det = clamped OCR
+        # box; rbox = clamped render box (enlarged_xyxy where the renderer actually drew, padded
+        # a little so component-overlap assignment catches border strokes).
+        infos = []
+        for r in regions:
+            tr = (getattr(r, 'translation', '') or '').strip()
+            if not tr:
+                continue
+            try:
+                dx1, dy1, dx2, dy2 = (int(v) for v in r.xyxy)
+            except Exception:
+                continue
+            dx1, dx2 = max(0, min(W, dx1)), max(0, min(W, dx2))
+            dy1, dy2 = max(0, min(H, dy1)), max(0, min(H, dy2))
+            if dx2 <= dx1 or dy2 <= dy1:
+                continue
+            rb = getattr(r, 'enlarged_xyxy', None)
+            try:
+                bx1, by1, bx2, by2 = (int(v) for v in rb) if rb is not None else (dx1, dy1, dx2, dy2)
+            except Exception:
+                bx1, by1, bx2, by2 = dx1, dy1, dx2, dy2
+            bx1 = max(0, bx1 - 6); by1 = max(0, by1 - 6)
+            bx2 = min(W, bx2 + 6); by2 = min(H, by2 + 6)
+            if bx2 <= bx1 or by2 <= by1:
+                bx1, by1, bx2, by2 = dx1, dy1, dx2, dy2
+            infos.append({
+                'det': (dx1, dy1, dx2, dy2), 'rbox': (bx1, by1, bx2, by2),
+                'tr': tr, 'src': (getattr(r, 'text', '') or ''), 'style': _style_hints(r),
+            })
+        if not infos:
+            return None
+
+        def _norm(x1, y1, x2, y2):
+            return {'x': x1 / W, 'y': y1 / H, 'w': (x2 - x1) / W, 'h': (y2 - y1) / H}
+
+        def _meta_bubble(info, region_xyxy):
+            dx1, dy1, dx2, dy2 = info['det']
+            bx1, by1, bx2, by2 = info['rbox']
+            return {
+                'box': _norm(dx1, dy1, dx2, dy2),
+                'rbox': _norm(bx1, by1, bx2, by2),
+                'region': _norm(*region_xyxy),
+                'tr': info['tr'], 'src': info['src'], 'style': info['style'],
+            }
+
+        if mode == 'text_only':
+            # Geometry/text/style only — region = union(detection box, render box), no pixels read.
+            bubbles = []
+            for info in infos:
+                dx1, dy1, dx2, dy2 = info['det']
+                bx1, by1, bx2, by2 = info['rbox']
+                bubbles.append(_meta_bubble(info, (min(dx1, bx1), min(dy1, by1), max(dx2, bx2), max(dy2, by2))))
+            return {'page': {'w': W, 'h': H}, 'bubbles': bubbles}
+
+        if inpainted is None or inpainted.shape[:2] != (H, W):
+            return None
+
+        def _img_data_url(arr, mode_, fmt='PNG', **save_kw):
+            buf = _io.BytesIO()
+            Image.fromarray(arr, mode_).save(buf, format=fmt, **save_kw)
+            mime = 'image/webp' if fmt == 'WEBP' else 'image/png'
+            return f'data:{mime};base64,' + base64.b64encode(buf.getvalue()).decode('ascii')
+
+        def _build_page_layers():
+            """CPU-bound, one job for the whole page. EXACTNESS INVARIANT: every pixel where the
+            final render differs from the inpaint is assigned to exactly ONE bubble, whose layer
+            stores the final render's RGB at full alpha. Reassembling all bubble layers over the
+            inpaint therefore reproduces the final translated page pixel-for-pixel — nothing is
+            cropped and nothing bleeds twice. Ownership is per pixel: the render box that
+            contains it (nearest box center on overlap), else the nearest render box — so
+            adjacent bubbles split cleanly at their boundary instead of stealing each other's
+            strokes (the old component-based assignment could do both)."""
+            diff = np.abs(rendered.astype(np.int16) - inpainted.astype(np.int16)).max(axis=2)
+            changed = diff > 0
+            # Defensive: a renderer that perturbs untouched pixels (full-page roundtrip) would
+            # mark everything changed; fall back to the visible-change threshold in that case.
+            if changed.mean() > 0.35:
+                changed = diff > 8
+            ys, xs = np.nonzero(changed)
+            if xs.size == 0:
+                return None
+
+            xf = xs.astype(np.float32)
+            yf = ys.astype(np.float32)
+            best_d = np.full(xs.shape, np.inf, dtype=np.float32)
+            owner = np.zeros(xs.shape, dtype=np.int32)
+            for ri, info in enumerate(infos):
+                bx1, by1, bx2, by2 = info['rbox']
+                # squared rect-distance to the render box (0 inside) + a tiny center-distance
+                # term that deterministically breaks ties between overlapping boxes.
+                dx = np.maximum(np.maximum(bx1 - xf, 0.0), xf - (bx2 - 1))
+                dy = np.maximum(np.maximum(by1 - yf, 0.0), yf - (by2 - 1))
+                d = dx * dx + dy * dy
+                cx, cy = (bx1 + bx2) * 0.5, (by1 + by2) * 0.5
+                d += ((xf - cx) ** 2 + (yf - cy) ** 2) * np.float32(1e-7)
+                m = d < best_d
+                best_d[m] = d[m]
+                owner[m] = ri
+
+            bubbles = []
+            for ri, info in enumerate(infos):
+                sel = owner == ri
+                if not sel.any():
+                    continue
+                rx, ry = xs[sel], ys[sel]
+                gx1, gy1 = int(rx.min()), int(ry.min())
+                gx2, gy2 = int(rx.max()) + 1, int(ry.max()) + 1
+                # Full-page transparent layer holding exactly this bubble's pixels: RGB from the
+                # final render (antialiasing against the inpaint already baked in), alpha 255 so
+                # compositing over the inpaint bg reproduces the render exactly.
+                text_rgba = np.zeros((H, W, 4), dtype=np.uint8)
+                text_rgba[ry, rx, :3] = rendered[ry, rx]
+                text_rgba[ry, rx, 3] = 255
+                # bg clip region = detection box unioned with the full glyph extent.
+                dx1, dy1, dx2, dy2 = info['det']
+                bubble = _meta_bubble(info, (min(dx1, gx1), min(dy1, gy1), max(dx2, gx2), max(dy2, gy2)))
+                bubble['text'] = _img_data_url(text_rgba, 'RGBA', 'PNG')
+                bubbles.append(bubble)
+            if not bubbles:
+                return None
+            # Shared inpaint bg is opaque art (no text) → WebP is far smaller than PNG at quality
+            # the eye can't tell apart, and it only ever shows behind a revealed bubble.
+            bg = _img_data_url(inpainted, 'RGB', 'WEBP', quality=90, method=6)
+            return {'page': {'w': W, 'h': H}, 'bg': bg, 'bubbles': bubbles}
+
+        return await run_cpu(_build_page_layers)
 
     def _add_logger_hook(self):
         # TODO: Pass ctx to logger hook
@@ -1632,9 +1956,18 @@ class MangaTranslator:
                     ctx = await self._complete_translation_pipeline(ctx, config)
                 results.append(ctx)
                 logger.debug(f'Image {i+1} post-processing completed')
+                # Stream this finished page out immediately (no-op without a hook).
+                try:
+                    await self._emit_page_result(i, getattr(ctx, 'result', None))
+                except Exception as emit_error:
+                    logger.error(f'Image {i+1} page-result emit error: {emit_error}')
             except Exception as e:
                 logger.error(f'Image {i+1} post-processing error: {e}')
                 results.append(ctx)
+                try:
+                    await self._emit_page_result(i, getattr(ctx, 'result', None))
+                except Exception as emit_error:
+                    logger.error(f'Image {i+1} page-result emit error: {emit_error}')
         
         logger.info(f'Batch translation completed: processed {len(results)} images')
 
@@ -1653,8 +1986,360 @@ class MangaTranslator:
 
         # 清理批量处理的图片上下文缓存
         self._saved_image_contexts.clear()
-        
+
         return results
+
+    async def translate_gallery_stream(self, images: List, config: Config, batch_size: int = 0, job_token: str = "") -> dict:
+        """Translate a whole gallery as ONE pipelined streaming request.
+
+        Used by the share server's /execute/translate_gallery_stream route. Returns a
+        small summary only — the rendered images leave incrementally through the
+        page-result hook (status-5 frames), never as a (huge) list of Contexts.
+
+        Unlike translate_batch (strict preprocess-all → translate-all → render-all),
+        the three stages overlap: pages are detected/OCR'd one by one on the GPU;
+        every `batch_size` preprocessed pages become one shared translation call that
+        runs on the network while later pages keep preprocessing; translated batches
+        are inpainted/rendered and emitted as soon as they come back. `batch_size`
+        <= 0 means all pages share a single translation call. Page entries may be
+        compressed image bytes (decoded here, one at a time) or PIL Images.
+
+        Cross-page context (chatgpt + --context-size) is request-local: batches are
+        chained in input order and the instance-global context lists are restored at
+        the end, so queued clients can't bleed context into each other and the client
+        no longer needs to call /reset-context.
+        """
+        import hashlib
+        import io as _io
+        import math
+        from .translators import OFFLINE_TRANSLATORS
+        from .utils.profiling import snapshot_substages
+
+        n = len(images)
+        if n == 0:
+            return {"count": 0, "failed": []}
+        cap = int(batch_size) if batch_size else 0
+        cap = n if cap <= 0 else min(cap, n)
+        num_batches = math.ceil(n / cap)
+
+        study_mode = str(getattr(config, 'study_mode_generation', 'disabled') or 'disabled')
+        # Run-attribution header: without it a profiler summary can't be tied to a configuration
+        # after the fact (translator, cap and study mode are what move the numbers).
+        logger.info(
+            f'Gallery run: pages={n} batch_size={cap} translator={config.translator.translator} '
+            f'target={config.translator.target_lang} renderer={config.render.renderer.value} '
+            f'study_mode_generation={study_mode} job_token={(job_token[:8] + "…") if job_token else "-"}')
+
+        is_ctx_mode = self.context_size > 0 and config.translator.translator in (
+            Translator.chatgpt, Translator.chatgpt_2stage)
+        # Offline translators run on the GPU themselves — their translation step must
+        # hold the GPU lock instead of overlapping with detection/inpainting.
+        try:
+            is_offline_tl = any(key in OFFLINE_TRANSLATORS for key, _ in config.translator.translator_gen.chain)
+        except Exception:
+            is_offline_tl = False
+
+        saved_pages, saved_originals = self.all_page_translations, self._original_page_texts
+        self.all_page_translations, self._original_page_texts = [], []
+        prev_concurrent, self.batch_concurrent = self.batch_concurrent, False
+        self._gallery_cancel = False
+        self._gallery_job_token = job_token   # stamped onto every status-5 page frame + checked by /cancel_gallery
+
+        self._stage_times = {}                # per-stage compute accumulator (filled by stage methods)
+        prewarm_proc_pool()                   # mask-refinement workers spawn while models load
+        prof = Profiler(interval=1.0)
+        prof.start()
+        _sub0 = snapshot_substages()          # host/kernel sub-splits reported by the models
+
+        # All CUDA runs on the single GPU worker thread (submit_gpu) → kernels serialize there, so no
+        # asyncio lock is needed for GPU ordering. Per-page context is carried on ctx (ctx.image_context);
+        # the parallel stages never read the mutable self._current_image_context, so the render/study
+        # workers run concurrently without racing. The pipeline is staged: producer (decode+detect+OCR)
+        # → run_batch (translate) → inpaint_stage (GPU inpaint) → render_worker×N (render+study+emit).
+        llm = asyncio.Semaphore(1 if (is_ctx_mode or is_offline_tl) else 6)
+        # Bound pages alive between preprocess and emit — each holds full-res buffers.
+        inflight = asyncio.Semaphore(max(cap * 3, 8))
+        post_q: asyncio.Queue = asyncio.Queue()       # S2→S3: translated batches → inpaint
+        render_q: asyncio.Queue = asyncio.Queue()     # S3→S4/S5: inpainted pages → render/study workers
+        NUM_RENDER = max(2, min(4, (os.cpu_count() or 4) // 2))
+        failed = set()
+        emitted = 0
+        study_meta_pages = 0    # pages that emitted a metadata-only status-6 frame (text_only)
+        study_image_pages = 0   # pages that emitted a full image-layer status-6 frame
+        bubbles_total = 0       # bubbles across all emitted study frames
+        was_cancelled = False
+
+        def _record_page_context(ctx):
+            if not ctx.text_regions:
+                return
+            self.all_page_translations.append({
+                (r.text_raw if hasattr(r, 'text_raw') else r.text): r.translation
+                for r in ctx.text_regions})
+            self._original_page_texts.append({
+                k: (r.text_raw if hasattr(r, 'text_raw') else r.text)
+                for k, r in enumerate(ctx.text_regions)})
+
+        async def run_batch(b_idx: int, batch: list, prev_task):
+            try:
+                if prev_task is not None:  # context mode: keep page order across batches
+                    await prev_task
+                async with llm:
+                    if self._gallery_cancel:
+                        raise asyncio.CancelledError()
+                    await self._report_progress(f'gallery-tl:{b_idx + 1}/{num_batches}')
+                    pairs = [(ctx, config) for _, ctx in batch]
+                    _tl_t0 = time.perf_counter()
+                    if is_offline_tl:
+                        # Offline translators run on the GPU — keep them on the GPU worker thread so
+                        # they serialize with detection/inpainting instead of racing for the device.
+                        await submit_gpu(self._batch_translate_contexts(pairs, len(pairs)))
+                    else:
+                        await self._batch_translate_contexts(pairs, len(pairs))
+                    self._accum_time('translation', time.perf_counter() - _tl_t0)
+                for _, ctx in batch:
+                    _record_page_context(ctx)
+                await self._report_progress(f'gallery-tl-done:{b_idx + 1}/{num_batches}')
+                await post_q.put(batch)
+            except asyncio.CancelledError:
+                await post_q.put([(idx, None) for idx, _ in batch])
+            except Exception as e:
+                logger.error(f'Gallery batch {b_idx + 1}/{num_batches} translation failed: {e}')
+                await post_q.put([(idx, None) for idx, _ in batch])
+
+        async def inpaint_stage():
+            """S3: pull each translated batch, inpaint every page on the GPU thread, and hand the
+            pages to the render/study workers. A single instance — the GPU serializes anyway — but
+            it never blocks on rendering, so the GPU keeps moving to the next page's inpaint."""
+            while True:
+                _t = time.perf_counter()
+                batch = await post_q.get()
+                prof.add_wait('post_q', time.perf_counter() - _t)
+                if batch is None:
+                    for _ in range(NUM_RENDER):
+                        await render_q.put(None)   # fan-out shutdown to the render workers
+                    return
+                # Prefetch mask refinement (heavy CPU: watershed/CC per page) for the whole
+                # batch concurrently on the CPU pool, so the GPU inpaints page k while page
+                # k+1's mask is still being refined instead of waiting ~1s per page for it.
+                async def _prefetch_mask(ctx):
+                    try:
+                        if ctx is not None and not self._gallery_cancel and ctx.text_regions and ctx.mask is None:
+                            ctx.mask = await self._run_mask_refinement(config, ctx)
+                    except Exception:
+                        pass   # left None — _inpaint_stage retries and owns the error path
+                prefetch = [asyncio.create_task(_prefetch_mask(ctx)) for _, ctx in batch]
+                for (idx, ctx), pf in zip(batch, prefetch):
+                    try:
+                        await pf
+                        if ctx is not None and not self._gallery_cancel and ctx.text_regions:
+                            ctx = await self._inpaint_stage(ctx, config)
+                    except Exception as e:
+                        logger.error(f'Gallery page {idx + 1} inpainting failed: {e}')
+                    await render_q.put((idx, ctx))
+
+        async def render_worker():
+            """S4+S5: render + final compose + study overlay + emit. NUM_RENDER of these run in
+            parallel on the CPU pool, so several pages typeset/encode at once while the GPU works
+            ahead on later pages. Pages may emit out of order — each frame carries its page index."""
+            nonlocal emitted, study_meta_pages, study_image_pages, bubbles_total
+            while True:
+                _t = time.perf_counter()
+                item = await render_q.get()
+                prof.add_wait('render_q', time.perf_counter() - _t)
+                if item is None:
+                    return
+                idx, ctx = item
+                try:
+                    if ctx is None or self._gallery_cancel:
+                        failed.add(idx)
+                        continue
+                    if ctx.text_regions and not getattr(ctx, '_skip_render', False):
+                        ctx = await self._render_stage(ctx, config)
+                    result = getattr(ctx, 'result', None)
+                    if result is not None:
+                        await self._emit_page_result(idx, result)
+                        # Per-page study payload (metadata and/or layers, per study_mode_generation)
+                        # — best-effort: a failure never fails the page.
+                        if study_mode != 'disabled':
+                            try:
+                                _study_t0 = time.perf_counter()
+                                study = await self._build_bubble_overlays(ctx, config, study_mode)
+                                self._accum_time('study_overlay', time.perf_counter() - _study_t0)
+                                if study:
+                                    await self._emit_page_bubbles(idx, study)
+                                    if study.get('bg') is not None:
+                                        study_image_pages += 1
+                                    else:
+                                        study_meta_pages += 1
+                                    bubbles_total += len(study.get('bubbles') or [])
+                            except Exception as e:
+                                logger.error(f'Gallery page {idx + 1} study overlay build failed: {e}')
+                        emitted += 1
+                    else:
+                        failed.add(idx)
+                except Exception as e:
+                    logger.error(f'Gallery page {idx + 1} post-processing failed: {e}')
+                    failed.add(idx)
+                finally:
+                    images[idx] = None  # free page memory as we go
+                    if ctx is not None:
+                        for attr in ('input', 'img_colorized', 'upscaled', 'img_rgb', 'img_alpha',
+                                     'mask_raw', 'mask', 'img_inpainted', 'gimp_mask', 'img_rendered',
+                                     'result', 'textlines', 'text_regions'):
+                            setattr(ctx, attr, None)
+                    inflight.release()
+
+        inpaint_task = asyncio.create_task(inpaint_stage())
+        render_tasks = [asyncio.create_task(render_worker()) for _ in range(NUM_RENDER)]
+        tl_tasks = []
+        pre_tasks = []
+
+        # ── S1: preprocess (decode + detect + OCR), PRE_WORKERS pages at a time ─────────
+        # A page's host work (decode, bilateral filter, warps, box extraction — all on the
+        # CPU pool since the models orchestrate their own placement) overlaps the previous
+        # page's GPU kernels, keeping the GPU thread fed. Batches must still form in strict
+        # page order (context mode, deterministic batching), so a sequencer consumes results
+        # in order; pre_window bounds how far the workers run ahead of it.
+        PRE_WORKERS = 3
+        pre_results: dict[int, object] = {}
+        pre_done = asyncio.Condition()
+        pre_window = asyncio.Semaphore(PRE_WORKERS + 2)
+        first_done = asyncio.Event()   # page 0 loads the models alone; later pages wait for it
+        next_idx = 0
+        pre_count = 0
+        _CANCELLED = object()
+
+        def _decode_page(i):
+            raw = images[i]
+            if isinstance(raw, (bytes, bytearray)):
+                img = Image.open(_io.BytesIO(raw))
+                img.load()   # force the actual pixel decode here, on the pool
+                md5 = hashlib.md5(raw).hexdigest()[:8]
+            else:
+                img = raw
+                md5 = f'{id(raw) & 0xffffffff:08x}'
+            return img, md5
+
+        async def preprocess_one(i):
+            _dec_t0 = time.perf_counter()
+            img, md5 = await run_cpu(_decode_page, i)
+            self._accum_time('decode', time.perf_counter() - _dec_t0)
+            # Per-page image context built locally — hashing the raw upload bytes instead of
+            # re-encoding the decoded page to PNG (which cost a full page encode per page).
+            # Only debug folder naming and the rendering_folder progress message consume it.
+            ic = {
+                'subfolder': f"{int(time.time() * 1000)}-{md5}-{config.detector.detection_size}-{config.translator.target_lang}-{config.translator.translator}",
+                'file_md5': md5,
+                'config': config,
+            }
+            self._current_image_context = ic
+            if self.verbose:
+                self._saved_image_contexts[md5] = dict(ic)
+            ctx = await self._translate_until_translation(img, config)
+            ctx.image_context = dict(ic)
+            ctx._gallery = True
+            ctx.verbose = self.verbose
+            return ctx
+
+        async def pre_worker():
+            nonlocal next_idx, pre_count
+            while True:
+                if next_idx >= n:
+                    return
+                i = next_idx
+                next_idx += 1
+                await pre_window.acquire()
+                if i > 0:
+                    await first_done.wait()
+                ctx = _CANCELLED
+                try:
+                    if not self._gallery_cancel:
+                        try:
+                            ctx = await preprocess_one(i)
+                        except Exception as e:
+                            logger.error(f'Gallery page {i + 1}/{n} pre-processing failed: {e}')
+                            ctx = Context()
+                            ctx.input = None
+                            ctx.text_regions = []
+                            ctx.result = None
+                finally:
+                    if i == 0:
+                        first_done.set()
+                if ctx is not _CANCELLED:
+                    pre_count += 1
+                    await self._report_progress(f'gallery-pre:{pre_count}/{n}')
+                async with pre_done:
+                    pre_results[i] = ctx
+                    pre_done.notify_all()
+
+        try:
+            pre_tasks = [asyncio.create_task(pre_worker()) for _ in range(PRE_WORKERS)]
+            batch = []
+            prev_task = None
+            cancelled_at = None
+            for i in range(n):
+                async with pre_done:
+                    while i not in pre_results:
+                        await pre_done.wait()
+                    ctx = pre_results.pop(i)
+                pre_window.release()
+                if ctx is _CANCELLED or self._gallery_cancel:
+                    cancelled_at = i
+                    break
+                await inflight.acquire()   # bounds pages alive between here and emit
+                batch.append((i, ctx))
+                if len(batch) >= cap or i == n - 1:
+                    task = asyncio.create_task(run_batch(len(tl_tasks), batch, prev_task if is_ctx_mode else None))
+                    tl_tasks.append(task)
+                    prev_task = task
+                    batch = []
+            if cancelled_at is not None:
+                for idx, c in batch:
+                    failed.add(idx)
+                    inflight.release()     # these never reach a render worker
+                failed.update(range(cancelled_at, n))
+                batch = []
+            for t in pre_tasks:
+                t.cancel()                 # no-ops when already finished
+            await asyncio.gather(*pre_tasks, return_exceptions=True)
+            if tl_tasks:
+                await asyncio.gather(*tl_tasks)
+            await post_q.put(None)        # drain: inpaint_stage finishes, then fans None out to the render workers
+            await inpaint_task
+            await asyncio.gather(*render_tasks)
+        except BaseException:
+            for t in pre_tasks:
+                t.cancel()
+            for t in tl_tasks:
+                t.cancel()
+            inpaint_task.cancel()
+            for t in render_tasks:
+                t.cancel()
+            raise
+        finally:
+            prof.stop()
+            was_cancelled = self._gallery_cancel
+            self.batch_concurrent = prev_concurrent
+            self.all_page_translations = saved_pages
+            self._original_page_texts = saved_originals
+            self._gallery_cancel = False
+            self._gallery_job_token = ""
+            self._saved_image_contexts.clear()
+
+        failed_list = sorted(failed)
+        # Fold the models' host/kernel sub-splits into the stage summary (det_pre/gpu/post,
+        # ocr_pre/gpu/post, inp_pre/gpu/post, mask_refine) — the split the wall numbers hide.
+        for k, v in snapshot_substages().items():
+            dv = v - _sub0.get(k, 0.0)
+            if dv > 0.05:
+                self._stage_times[k] = dv
+        logger.info('Gallery ' + prof.summary(self._stage_times, n, emitted))
+        logger.info(
+            f'Gallery pipeline completed: {emitted}/{n} pages emitted, {len(failed_list)} failed, '
+            f'study_mode={study_mode} study_pages(meta={study_meta_pages}, image={study_image_pages}) '
+            f'bubbles={bubbles_total}'
+            + (' — CANCELLED (client cancel or liveness reaper)' if was_cancelled else ''))
+        return {"count": n, "failed": failed_list}
 
     async def _translate_until_translation(self, image: Image.Image, config: Config) -> Context:
         """
@@ -1720,17 +2405,18 @@ class MangaTranslator:
         else:
             ctx.upscaled = ctx.img_colorized
 
-        ctx.img_rgb, ctx.img_alpha = load_image(ctx.upscaled)
+        # PIL→numpy of a full page is tens of ms — keep it off the orchestrating loop.
+        ctx.img_rgb, ctx.img_alpha = await run_cpu(load_image, ctx.upscaled)
 
         # -- Detection
         await self._report_progress('detection')
         try:
             ctx.textlines, ctx.mask_raw, ctx.mask = await self._run_detection(config, ctx)
-        except Exception as e:  
-            logger.error(f"Error during detection:\n{traceback.format_exc()}")  
-            if not self.ignore_errors:  
-                raise 
-            ctx.textlines = [] 
+        except Exception as e:
+            logger.error(f"Error during detection:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
+            ctx.textlines = []
             ctx.mask_raw = None
             ctx.mask = None
 
@@ -2479,18 +3165,34 @@ class MangaTranslator:
         return ctx.text_regions
 
     async def _complete_translation_pipeline(self, ctx: Context, config: Config) -> Context:
+        """完成翻译后的处理步骤（掩码细化、修复、渲染）。
+
+        Split into a GPU/per-image-context stage (`_inpaint_stage`) and a CPU stage
+        (`_render_stage`) so the streaming gallery path can hold the GPU lock for the
+        former while running the latter — rendering + final composition — outside the
+        lock, overlapping it with the next page's detection/OCR. This wrapper preserves
+        the original single-call behaviour for every other caller.
         """
-        完成翻译后的处理步骤（掩码细化、修复、渲染）
-        """
+        ctx = await self._inpaint_stage(ctx, config)
+        if getattr(ctx, '_skip_render', False):
+            return ctx
+        return await self._render_stage(ctx, config)
+
+    async def _inpaint_stage(self, ctx: Context, config: Config) -> Context:
+        """GPU + per-image-context half of the post-translation pipeline: mask refinement
+        and inpainting. On no-text / cancel it finalizes the result and sets `_skip_render`
+        so the caller skips the render stage."""
         await self._report_progress('after-translating')
 
         if not ctx.text_regions:
             await self._report_progress('error-translating', True)
             ctx.result = ctx.upscaled
+            ctx._skip_render = True
             return await self._revert_upscale(config, ctx)
         elif ctx.text_regions == 'cancel':
             await self._report_progress('cancelled', True)
             ctx.result = ctx.upscaled
+            ctx._skip_render = True
             return await self._revert_upscale(config, ctx)
 
         # -- Mask refinement
@@ -2535,7 +3237,12 @@ class MangaTranslator:
                 raise
             else:
                 ctx.img_inpainted = ctx.img_rgb
-        ctx.gimp_mask = np.dstack((cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR), ctx.mask))
+        if getattr(ctx, '_gallery', False):
+            # Only the GIMP save format reads gimp_mask; the gallery path never does, and the
+            # full-page dstack+cvtColor per page is pure loop-blocking waste there.
+            ctx.gimp_mask = None
+        else:
+            ctx.gimp_mask = np.dstack((cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR), ctx.mask))
 
         if self.verbose:
             try:
@@ -2547,14 +3254,21 @@ class MangaTranslator:
                 logger.error(f"Error saving inpainted.png debug image: {e}")
                 logger.debug(f"Exception details: {traceback.format_exc()}")
 
+        return ctx
+
+    async def _render_stage(self, ctx: Context, config: Config) -> Context:
+        """CPU half of the post-translation pipeline: text rendering + final composition.
+        Reads only `ctx` (its per-page `image_context`), never the mutable
+        `self._current_image_context`, so it is safe to run OUTSIDE the GPU lock and overlap
+        with the next page's detection/OCR."""
         # -- Rendering
         await self._report_progress('rendering')
 
         # 在rendering状态后立即发送文件夹信息，用于前端精确检查final.png
-        if hasattr(self, '_progress_hooks') and self._current_image_context:
-            folder_name = self._current_image_context['subfolder']
+        ic = getattr(ctx, 'image_context', None) or self._current_image_context
+        if hasattr(self, '_progress_hooks') and ic:
             # 发送特殊格式的消息，前端可以解析
-            await self._report_progress(f'rendering_folder:{folder_name}')
+            await self._report_progress(f"rendering_folder:{ic['subfolder']}")
 
         try:
             ctx.img_rendered = await self._run_text_rendering(config, ctx)
@@ -2565,8 +3279,8 @@ class MangaTranslator:
             ctx.img_rendered = ctx.img_inpainted
 
         await self._report_progress('finished', True)
-        ctx.result = dump_image(ctx.input, ctx.img_rendered, ctx.img_alpha)
-        
+        ctx.result = await run_cpu(dump_image, ctx.input, ctx.img_rendered, ctx.img_alpha)
+
         # 保存debug文件夹信息到Context中（用于Web模式的缓存访问）
         if self.verbose:
             ctx.debug_folder = self._get_image_subfolder()

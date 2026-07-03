@@ -5,6 +5,7 @@ import numpy as np
 import freetype
 import functools
 import logging
+import threading
 from pathlib import Path
 from typing import Tuple, Optional, List
 from hyphen import Hyphenator
@@ -212,23 +213,43 @@ FALLBACK_FONTS = [
     os.path.join(BASE_PATH, 'fonts/msyh.ttc'),
     os.path.join(BASE_PATH, 'fonts/msgothic.ttc'),
 ]
-FONT_SELECTION: List[freetype.Face] = []
-font_cache = {}
+# freetype.Face objects are NOT thread-safe — a shared Face's glyph slot gets corrupted by
+# concurrent load_char (FT_Exception "code overflow" / "unsupported glyph image format"). The
+# gallery pipeline renders several pages in parallel on the CPU pool, so each thread keeps its
+# OWN font cache + selection. Face *creation* on the shared FreeType library is serialized too
+# (cheap — once per thread per font); rendering then proceeds concurrently on per-thread faces.
+_tls = threading.local()
+_face_create_lock = threading.Lock()
+
+def _thread_font_cache() -> dict:
+    cache = getattr(_tls, 'font_cache', None)
+    if cache is None:
+        cache = _tls.font_cache = {}
+    return cache
+
 def get_cached_font(path: str) -> freetype.Face:
     path = path.replace('\\', '/')
-    if not font_cache.get(path):
+    cache = _thread_font_cache()
+    if not cache.get(path):
         # To circumvent a bug with non ascii paths in windows use memory fonts
         # https://github.com/rougier/freetype-py/issues/157#issuecomment-1683713726
-        font_cache[path] = freetype.Face(Path(path).open('rb'))
-    return font_cache[path]
+        with _face_create_lock:
+            cache[path] = freetype.Face(Path(path).open('rb'))
+    return cache[path]
 
 def set_font(font_path: str):
-    global FONT_SELECTION
     if font_path:
         selection = [font_path] + FALLBACK_FONTS
     else:
         selection = FALLBACK_FONTS
-    FONT_SELECTION = [get_cached_font(p) for p in selection]
+    _tls.font_selection = [get_cached_font(p) for p in selection]
+
+def _font_selection() -> List[freetype.Face]:
+    sel = getattr(_tls, 'font_selection', None)
+    if sel is None:          # thread rendered before calling set_font — fall back to defaults
+        set_font('')
+        sel = _tls.font_selection
+    return sel
 
 class namespace:
     pass
@@ -254,9 +275,9 @@ class Glyph:
 
 @functools.lru_cache(maxsize = 1024, typed = True)
 def get_char_glyph(cdpt: str, font_size: int, direction: int) -> Glyph:
-    global FONT_SELECTION
-    for i, face in enumerate(FONT_SELECTION):
-        if face.get_char_index(cdpt) == 0 and i != len(FONT_SELECTION) - 1:
+    selection = _font_selection()
+    for i, face in enumerate(selection):
+        if face.get_char_index(cdpt) == 0 and i != len(selection) - 1:
             continue
         if direction == 0:
             face.set_pixel_sizes(0, font_size)
@@ -267,9 +288,9 @@ def get_char_glyph(cdpt: str, font_size: int, direction: int) -> Glyph:
 
 #@functools.lru_cache(maxsize = 1024, typed = True)
 def get_char_border(cdpt: str, font_size: int, direction: int):
-    global FONT_SELECTION
-    for i, face in enumerate(FONT_SELECTION):
-        if face.get_char_index(cdpt) == 0 and i != len(FONT_SELECTION) - 1:
+    selection = _font_selection()
+    for i, face in enumerate(selection):
+        if face.get_char_index(cdpt) == 0 and i != len(selection) - 1:
             continue
         if direction == 0:
             face.set_pixel_sizes(0, font_size)

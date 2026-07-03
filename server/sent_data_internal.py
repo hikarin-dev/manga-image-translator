@@ -10,16 +10,50 @@ from manga_translator import Config
 
 NotifyType = Optional[Callable[[int, Optional[bytes]], None]]
 
+# A streaming translation (a whole gallery, or one big page) legitimately runs far longer than
+# aiohttp's DEFAULT 5-minute total timeout — a slow LLM batch alone can exceed it. That default
+# silently killed long gallery jobs mid-way (asyncio.TimeoutError → "Translation failed:") while
+# the worker, never told to stop, kept churning the GPU into the dead connection. We cap only
+# connection setup and idle gaps (sock_read), never total runtime, so a job runs as long as it
+# keeps making progress; a truly hung worker still trips sock_read instead of hanging forever.
+_STREAM_TIMEOUT = aiohttp.ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=900)
+
 async def fetch_data_stream(url, image: Image, config: Config, sender: NotifyType, headers: Mapping[str, str] = {}):
     attributes = {"image": image, "config": config}
     data = pickle.dumps(attributes)
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=_STREAM_TIMEOUT) as session:
         async with session.post(url, data=data, headers=headers) as response:
             if response.status == 200:
                 await process_stream(response, sender)
             else:
                 raise HTTPException(response.status, detail=await response.text())
+
+async def fetch_gallery_stream(url, images: list, config: Config, sender: NotifyType, batch_size: int = 0, job_token: str = "", headers: Mapping[str, str] = {}):
+    """Stream a whole-gallery batch translation. Pickles all page images (kept as
+    compressed bytes; the worker decodes them one at a time) + config to the worker's
+    translate_gallery_stream; the worker streams progress (1), per-page result (5)
+    and a final summary (0) frames, handled the same way as a single image."""
+    attributes = {"images": images, "config": config, "batch_size": batch_size, "job_token": job_token}
+    data = pickle.dumps(attributes)
+
+    async with aiohttp.ClientSession(timeout=_STREAM_TIMEOUT) as session:
+        async with session.post(url, data=data, headers=headers) as response:
+            if response.status == 200:
+                await process_stream(response, sender)
+            else:
+                raise HTTPException(response.status, detail=await response.text())
+
+async def post_cancel(url, job_token: str = "", headers: Mapping[str, str] = {}):
+    """Best-effort fire-and-forget POST (gallery cancellation); never raises.
+    Sends the job_token as a form field so the worker can verify it's cancelling
+    the right job."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data={"job_token": job_token}, headers=headers):
+                pass
+    except Exception:
+        pass
 
 async def fetch_data(url, image: Image, config: Config, headers: Mapping[str, str] = {}):
     attributes = {"image": image, "config": config}

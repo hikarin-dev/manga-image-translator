@@ -5,7 +5,7 @@ from PIL import Image
 from pydantic import BaseModel
 
 from manga_translator import Config
-from server.sent_data_internal import fetch_data_stream, NotifyType, fetch_data
+from server.sent_data_internal import fetch_data_stream, NotifyType, fetch_data, fetch_gallery_stream, post_cancel
 
 class ExecutorInstance(BaseModel):
     ip: str
@@ -20,6 +20,12 @@ class ExecutorInstance(BaseModel):
 
     async def sent_stream(self, image: Image, config: Config, sender: NotifyType):
         await fetch_data_stream("http://"+self.ip+":"+str(self.port)+"/execute/translate", image, config, sender)
+
+    async def sent_gallery_stream(self, images: List, config: Config, sender: NotifyType, batch_size: int = 0, job_token: str = ""):
+        await fetch_gallery_stream("http://"+self.ip+":"+str(self.port)+"/execute/translate_gallery_stream", images, config, sender, batch_size, job_token)
+
+    async def cancel_gallery(self, job_token: str = ""):
+        await post_cancel("http://"+self.ip+":"+str(self.port)+"/cancel_gallery", job_token)
 
     async def sent_batch(self, images: List[Image.Image], config: Config, batch_size: int):
         """发送批量翻译请求"""

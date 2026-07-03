@@ -230,6 +230,18 @@ class TranslatorConfig(BaseModel):
     selective_translation: Optional[str] = None
     """Select a translator based on detected language in image. Note the first translation service acts as default if the language isn\'t defined. Example: --translator-chain "google:JPN;sugoi:ENG".'"""
     
+    content_screen_enabled: bool = False
+    """Pre-screen bubbles with a local model before sending to primary translator"""
+    content_screen_translator: str = 'qwen2_big'
+    """Local model to use for content screening"""
+    content_screen_fallback_translator: str = 'qwen2_big'
+    """Translator to use for bubbles flagged as explicit"""
+    content_screen_prompt: str = (
+        'For each numbered line below, reply with only "true" or "false" on a new numbered line. '
+        'true = the text is sexually explicit or graphic; false = it is not. Err on the side of true.\n'
+    )
+    """Classification prompt sent to the screen model"""
+
     # 译后检查配置项
     enable_post_translation_check: bool = True
     """Enable post-translation validation check"""
@@ -335,6 +347,10 @@ class Config(BaseModel):
     ocr: OcrConfig = OcrConfig()
     """Ocr configs"""
     # ?
+    study_mode_generation: Literal["disabled", "text_only", "text_and_image"] = "disabled"
+    """Per-page study layer generation for gallery translations: disabled emits final pages only,
+    text_only emits per-bubble geometry/text/style metadata, text_and_image also emits the
+    full-page image layers (current study-mode payload)."""
     force_simple_sort: bool = False
     """Don't use panel detection for sorting, use a simpler fallback logic instead"""
     kernel_size: int = 3

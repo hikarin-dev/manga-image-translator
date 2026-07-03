@@ -18,7 +18,7 @@ ImageHash
 kornia
 backports.cached-property
 huggingface_hub
-transformers
+transformers==4.46.3  # pinned: transformers 5.x needs torch>=2.7 and breaks manga-ocr
 py3langid==0.2.2
 sentencepiece
 editdistance
@@ -48,7 +48,8 @@ pyhyphen
 langcodes[data]
 manga-ocr
 langdetect
-pydensecrf@https://github.com/lucasb-eyer/pydensecrf/archive/refs/heads/master.zip
+# pydensecrf disabled on Windows (no C++ build toolchain); refine_mask falls back gracefully.
+# pydensecrf@https://github.com/lucasb-eyer/pydensecrf/archive/refs/heads/master.zip
 accelerate
 bitsandbytes
 uvicorn

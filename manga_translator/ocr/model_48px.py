@@ -17,10 +17,14 @@ from .xpos_relative_position import XPOS
 
 # Roformer with Xpos and Local Attention ViT
 
+import time
+
 from .common import OfflineOCR
 from ..utils import TextBlock, Quadrilateral, chunks
 from ..utils.generic import AvgMeter
 from ..utils.bubble import is_ignore
+from ..utils.executors import run_cpu, submit_gpu
+from ..utils.profiling import add_substage
 
 # Roformer with Xpos
 
@@ -64,13 +68,24 @@ class Model48pxOCR(OfflineOCR):
     async def _unload(self):
         del self.model
     
+    # _infer orchestrates its own placement: the perspective warps (pre) and the
+    # char-decode loop (post) run off the GPU thread; only the beam search — the exact
+    # same call with the exact same inputs — runs on it, so OCR results are unchanged.
+    _SELF_ORCHESTRATED = True
+
     async def _infer(self, image: np.ndarray, textlines: List[Quadrilateral], config: OcrConfig, verbose: bool = False, ignore_bubble: int = 0) -> List[TextBlock]:
         text_height = 48
         max_chunk_size = 16
         threshold = 0.2 if config.prob is None else config.prob
 
         quadrilaterals = list(self._generate_text_direction(textlines))
-        region_imgs = [q.get_transformed_region(image, d, text_height) for q, d in quadrilaterals]
+
+        def _warp_regions():
+            t0 = time.perf_counter()
+            out = [q.get_transformed_region(image, d, text_height) for q, d in quadrilaterals]
+            add_substage('ocr_pre', time.perf_counter() - t0)
+            return out
+        region_imgs = await run_cpu(_warp_regions)
         out_regions = []
 
         perm = range(len(region_imgs))
@@ -112,12 +127,22 @@ class Model48pxOCR(OfflineOCR):
                     compression_params = [cv2.IMWRITE_PNG_COMPRESSION, 9]
                     cv2.imwrite(os.path.join(ocr_result_dir, f'{ix}.png'), img_data, compression_params)
                 ix += 1
-            image_tensor = (torch.from_numpy(region).float() - 127.5) / 127.5
-            image_tensor = einops.rearrange(image_tensor, 'N H W C -> N C H W')
-            if self.use_gpu:
-                image_tensor = image_tensor.to(self.device)
-            with torch.no_grad():
-                ret = self.model.infer_beam_batch_tensor(image_tensor, widths, beams_k = 5, max_seq_length = 255)
+            async def _beam(region_np=region, widths_=widths):
+                t0 = time.perf_counter()
+                image_tensor = (torch.from_numpy(region_np).float() - 127.5) / 127.5
+                image_tensor = einops.rearrange(image_tensor, 'N H W C -> N C H W')
+                if self.use_gpu:
+                    image_tensor = image_tensor.to(self.device)
+                with torch.no_grad():
+                    out = self.model.infer_beam_batch_tensor(image_tensor, widths_, beams_k = 5, max_seq_length = 255)
+                # Move the result tensors to CPU here, on the GPU thread, so the decode loop
+                # below (which .item()s per character) never syncs against the GPU lane.
+                out = [(ci.cpu(), prob, fg.cpu(), bg.cpu(), fgi.cpu(), bgi.cpu())
+                       for ci, prob, fg, bg, fgi, bgi in out]
+                add_substage('ocr_gpu', time.perf_counter() - t0)
+                return out
+            ret = await submit_gpu(_beam())
+            _post_t0 = time.perf_counter()
             for i, (pred_chars_index, prob, fg_pred, bg_pred, fg_ind_pred, bg_ind_pred) in enumerate(ret):
                 if prob < threshold:
                     continue
@@ -158,7 +183,7 @@ class Model48pxOCR(OfflineOCR):
                 br = min(max(int(br()), 0), 255)
                 bg = min(max(int(bg()), 0), 255)
                 bb = min(max(int(bb()), 0), 255)
-                self.logger.info(f'prob: {prob} {txt} fg: ({fr}, {fg}, {fb}) bg: ({br}, {bg}, {bb})')
+                self.logger.debug(f'prob: {prob} {txt} fg: ({fr}, {fg}, {fb}) bg: ({br}, {bg}, {bb})')
                 cur_region = quadrilaterals[indices[i]][0]
                 if isinstance(cur_region, Quadrilateral):
                     cur_region.text = txt
@@ -174,6 +199,7 @@ class Model48pxOCR(OfflineOCR):
                     cur_region.update_font_colors(np.array([fr, fg, fb]), np.array([br, bg, bb]))
 
                 out_regions.append(cur_region)
+            add_substage('ocr_post', time.perf_counter() - _post_t0)
 
         if is_quadrilaterals:
             return out_regions

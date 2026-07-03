@@ -17,6 +17,7 @@ from ..utils import (
     get_logger,
     rotate_polygons,
 )
+from ..utils.executors import run_cpu
 
 logger = get_logger('render')
 
@@ -245,21 +246,27 @@ async def dispatch(
     disable_font_border: bool = False
     ) -> np.ndarray:
 
-    text_render.set_font(font_path)
-    text_regions = list(filter(lambda region: region.translation, text_regions))
+    def _sync():
+        text_render.set_font(font_path)
+        regions = list(filter(lambda region: region.translation, text_regions))
 
-    # Resize regions that are too small
-    dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum)
+        # Resize regions that are too small
+        dst_points_list = resize_regions_to_font_size(img, regions, font_size_fixed, font_size_offset, font_size_minimum)
 
-    # TODO: Maybe remove intersections
+        # TODO: Maybe remove intersections
 
-    # Render text
-    for region, dst_points in tqdm(zip(text_regions, dst_points_list), '[render]', total=len(text_regions)):
-        if render_mask is not None:
-            # set render_mask to 1 for the region that is inside dst_points
-            cv2.fillConvexPoly(render_mask, dst_points.astype(np.int32), 1)
-        img = render(img, region, dst_points, hyphenate, line_spacing, disable_font_border)
-    return img
+        # Render text
+        out = img
+        for region, dst_points in tqdm(zip(regions, dst_points_list), '[render]', total=len(regions)):
+            if render_mask is not None:
+                # set render_mask to 1 for the region that is inside dst_points
+                cv2.fillConvexPoly(render_mask, dst_points.astype(np.int32), 1)
+            out = render(out, region, dst_points, hyphenate, line_spacing, disable_font_border)
+        return out
+
+    # Rendering is CPU-bound (font rasterization + perspective warps); run it on the
+    # shared CPU pool so it overlaps with GPU detection/OCR/inpainting of other pages.
+    return await run_cpu(_sync)
 
 def render(
     img,
@@ -414,10 +421,14 @@ async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, 
         return img_canvas
 
     if not font_path:
-        font_path = os.path.join(BASE_PATH, 'fonts/comic shanns 2.ttf')
-    text_render.set_font(font_path)
+        # CC Victory Speech — the comic-lettering font Ichigo uses (converted from its woff2).
+        font_path = os.path.join(BASE_PATH, 'fonts/ccvictoryspeech.ttf')
 
-    return render_textblock_list_eng(img_canvas, text_regions, line_spacing=line_spacing, size_tol=1.2, original_img=original_img, downscale_constraint=0.8,disable_font_border=disable_font_border)
+    def _sync():
+        # set_font MUST run on the same thread as the render — font faces are thread-local.
+        text_render.set_font(font_path)
+        return render_textblock_list_eng(img_canvas, text_regions, line_spacing=line_spacing, size_tol=1.2, original_img=original_img, downscale_constraint=0.8, disable_font_border=disable_font_border)
+    return await run_cpu(_sync)
 
 async def dispatch_eng_render_pillow(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False) -> np.ndarray:
     if len(text_regions) == 0:
@@ -425,6 +436,9 @@ async def dispatch_eng_render_pillow(img_canvas: np.ndarray, original_img: np.nd
 
     if not font_path:
         font_path = os.path.join(BASE_PATH, 'fonts/NotoSansMonoCJK-VF.ttf.ttc')
-    text_render.set_font(font_path)
 
-    return render_textblock_list_eng_pillow(font_path, img_canvas, text_regions, original_img=original_img, downscale_constraint=0.95)
+    def _sync():
+        # set_font MUST run on the same thread as the render — font faces are thread-local.
+        text_render.set_font(font_path)
+        return render_textblock_list_eng_pillow(font_path, img_canvas, text_regions, original_img=original_img, downscale_constraint=0.95)
+    return await run_cpu(_sync)

@@ -9,6 +9,24 @@ from .common import CommonTranslator, VALID_LANGUAGES
 from typing import List, Dict
 
 
+# LLMs don't always emit the exact "<|N|>" line markers. This leniently matches
+# malformed variants so we can rewrite them to the canonical form before parsing:
+#   - missing the closing pipe:        <|3>
+#   - stray whitespace:                <| 3 |>
+#   - digits written as look-alikes:   l/L/I/i -> 1, O/o -> 0  (e.g. <|2l|> = 21)
+# The opening "<|" is required so we don't touch things like "<3" in the text itself.
+_ID_TAG_RE   = re.compile(r'<\s*\|\s*([0-9OoIilL]+)\s*\|?\s*>')
+_ID_CHAR_FIX = str.maketrans({'l': '1', 'L': '1', 'I': '1', 'i': '1', 'O': '0', 'o': '0'})
+
+def normalize_id_tags(text: str) -> str:
+    """Rewrite loose/garbled <|N|> markers in an LLM response to the canonical form."""
+    if not text:
+        return text
+    def _repl(m):
+        digits = m.group(1).translate(_ID_CHAR_FIX)
+        return f'<|{int(digits)}|>'
+    return _ID_TAG_RE.sub(_repl, text)
+
 
 class CommonGPTTranslator(ConfigGPT, CommonTranslator):
     """
@@ -247,8 +265,10 @@ class CommonGPTTranslator(ConfigGPT, CommonTranslator):
     
 
     def _parse_response(self, response: str, queries: List):
-        # Split response into translations  
-        new_translations = re.split(r'<\|\d+\|>', response)  
+        # Repair loose/garbled line markers (missing pipe, l/I->1, etc.) first.
+        response = normalize_id_tags(response)
+        # Split response into translations
+        new_translations = re.split(r'<\|\d+\|>', response)
         
         # 立即清理每个翻译文本的前后空格
         # Immediately clean leading and trailing whitespace from each translation text

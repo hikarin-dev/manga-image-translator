@@ -10,7 +10,7 @@ import asyncio
 import time
 from typing import List
 from .common import MissingAPIKeyException
-from .common_gpt import CommonGPTTranslator
+from .common_gpt import CommonGPTTranslator, normalize_id_tags
 from .keys import DEEPSEEK_API_KEY, DEEPSEEK_API_BASE, DEEPSEEK_MODEL
 from .tokenizers.token_counters import deepseekTokenCounter
 
@@ -18,18 +18,22 @@ from .tokenizers.token_counters import deepseekTokenCounter
 class DeepseekTranslator(CommonGPTTranslator):
     _INVALID_REPEAT_COUNT = 0  # 现在这个参数没意义了
     _MAX_REQUESTS_PER_MINUTE = 9999  # 无RPM限制
-    _TIMEOUT = 40  # 在重试之前等待服务器响应的时间（秒）
+    _TIMEOUT = 60  # seconds to wait for a response before retrying — cold/slow first requests
+                   # (the common "first few requests fail then it works" pattern) need more room
+                   # than the old 40s, which cancelled requests that were about to land.
     _RETRY_ATTEMPTS = 3  # 在放弃之前重试错误请求的次数
-    _TIMEOUT_RETRY_ATTEMPTS = 3  # 在放弃之前重试超时请求的次数
+    _TIMEOUT_RETRY_ATTEMPTS = 2  # 在放弃之前重试超时请求的次数 (kept low so the per-batch budget stays bounded)
     _RATELIMIT_RETRY_ATTEMPTS = 3  # 在放弃之前重试速率限制请求的次数
 
     # 最大令牌数量，用于控制处理的文本长度
     # Maximum token count for controlling the length of text processed
-    # 
-    # 最大输出长度: 8K
-    # MAX OUTPUT TOKENS: 8K
+    #
+    # 最大输出长度: 8K (deepseek-chat/reasoner) / 384K (deepseek-v4-*)
+    # MAX OUTPUT TOKENS: 8K (deepseek-chat/reasoner) / 384K (deepseek-v4-*)
     # -- https://api-docs.deepseek.com/quick_start/pricing
-    _MAX_TOKENS = 8000
+    # V4 models get a higher cap so large page batches fit in one request instead of
+    # being split by _assemble_prompts; older models reject max_tokens > 8K.
+    _MAX_TOKENS = 32000 if DEEPSEEK_MODEL.startswith('deepseek-v4') else 8000
 
     # 将每个 prompt 限制为最大输出 tokens 的 50％。
     # （这是一个任意比率，用于解释语言之间的差异。）
@@ -122,8 +126,6 @@ class DeepseekTranslator(CommonGPTTranslator):
                     request_task = asyncio.create_task(self._request_translation(to_lang, prompt))
                     started = time.time()
                     timeout_attempt = 0
-                    ratelimit_attempt = 0
-                    server_error_attempt = 0
                     while not request_task.done():
                         await asyncio.sleep(0.1)
                         if time.time() - started > self._TIMEOUT + (timeout_attempt * self._TIMEOUT / 2):
@@ -137,11 +139,14 @@ class DeepseekTranslator(CommonGPTTranslator):
                             started = time.time()
 
                     # Get the response
-                    response = await request_task  
-                    self.logger.debug(f'-- GPT Response{split_prefix} --\n' + response)  
+                    response = await request_task
+                    # Repair loose/garbled line markers (missing pipe, l/I->1, etc.) so
+                    # malformed tags split correctly and don't leak into the translation.
+                    response = normalize_id_tags(response)
+                    self.logger.debug(f'-- GPT Response{split_prefix} --\n' + response)
 
-                    # Split response into translations  
-                    new_translations = re.split(r'<\|\d+\|>', response)  
+                    # Split response into translations
+                    new_translations = re.split(r'<\|\d+\|>', response)
                     
                     # 立即清理每个翻译文本的前后空格
                     # Immediately clean leading and trailing whitespace from each translation text
@@ -183,19 +188,24 @@ class DeepseekTranslator(CommonGPTTranslator):
                     self.logger.debug(f'Completed translations: {[t if t else queries[i] for i, t in enumerate(translations)]}')        
                     return True  # Successfully translated this batch  
                     
-                except openai.APIError:  
-                    server_error_attempt += 1
-                    if server_error_attempt >= self._RETRY_ATTEMPTS:
+                except openai.APIError as e:
+                    # Server error / timeout / connection reset. These dominate the cold-start
+                    # "first few requests fail" pattern, so back off (a few seconds) to let the
+                    # API warm up before retrying — a fixed 1s retried into the same cold window.
+                    if attempt == RETRY_ATTEMPTS - 1:
                         self.logger.error(
-                            'Deepseek encountered a server error, possibly due to high server load. Use a different translator or try again later.')
+                            'Deepseek server error after retries, possibly high server load. '
+                            'Use a different translator or try again later.')
                         raise
-                    self.logger.warning(f'Restarting request due to a server error. Attempt: {server_error_attempt}')
-                    await asyncio.sleep(1)
-                except Exception as e:  
-                    self.logger.error(f'Error during translation attempt: {e}')  
-                    if attempt == RETRY_ATTEMPTS - 1:  
-                        raise  
-                    await asyncio.sleep(1)  
+                    backoff = min(2 ** attempt, 8)
+                    self.logger.warning(f'Restarting request due to a server error ({type(e).__name__}). '
+                                        f'Attempt {attempt + 1}/{RETRY_ATTEMPTS}, retrying in {backoff}s.')
+                    await asyncio.sleep(backoff)
+                except Exception as e:
+                    self.logger.error(f'Error during translation attempt: {e}')
+                    if attempt == RETRY_ATTEMPTS - 1:
+                        raise
+                    await asyncio.sleep(min(2 ** attempt, 8))
 
             # If retries exhausted and still not successful, proceed to split if allowed  
             if split_level < MAX_SPLIT_ATTEMPTS:  
@@ -220,10 +230,17 @@ class DeepseekTranslator(CommonGPTTranslator):
                     self.logger.error(f'Query: {queries[idx]}')  
                 return False  # Indicate failure for this batch   
 
-        # Begin translation process  
-        prompt_queries = queries  
-        prompt_query_indices = list(range(len(queries)))  
-        await translate_batch(prompt_queries, prompt_query_indices)  
+        # Begin translation process. Walk the assembler's own token-bounded chunking and
+        # translate EVERY chunk, not just the first. _assemble_prompts splits the queries
+        # when their combined size exceeds _MAX_TOKENS_IN; the previous code took only the
+        # first chunk via .__next__() and silently dropped the rest. Sending each chunk as
+        # its own request keeps all text translated (an extra request only when needed).
+        _start = 0
+        for _prompt, _chunk_size in self._assemble_prompts(from_lang, to_lang, queries):
+            _sub_queries = queries[_start:_start + _chunk_size]
+            _sub_indices = list(range(_start, _start + _chunk_size))
+            await translate_batch(_sub_queries, _sub_indices)
+            _start += _chunk_size
 
         self.logger.debug(translations)  
         if self.token_count_last:  
@@ -244,12 +261,22 @@ class DeepseekTranslator(CommonGPTTranslator):
         kwargs = {
             'model': DEEPSEEK_MODEL,
             'messages': messages,
-            
+
             # `max_tokens` only affects output token length. Set to max.
-            'max_tokens': self._MAX_TOKENS, 
-            
+            'max_tokens': self._MAX_TOKENS,
+
             'temperature': self.temperature,
             'top_p': self.top_p,
+
+            # Give the request a deterministic timeout instead of the openai client default,
+            # so a cold/slow first request fails predictably (→ a backed-off retry below) rather
+            # than the early, opaque "Request timed out" we were seeing on the first batch.
+            'timeout': self._TIMEOUT,
+
+            # Disable chain-of-thought thinking mode — not needed for translation
+            # and causes timeouts due to extra reasoning tokens before the response.
+            # Must go in extra_body, not top-level; parse() rejects unknown kwargs.
+            'extra_body': {'thinking': {'type': 'disabled'}},
         }
         try:
             response = await self.client.beta.chat.completions.parse(**kwargs)

@@ -478,6 +478,8 @@ def render_textblock_list_eng(
         if font_size_multiplier < 1:
             font_size = int(font_size * font_size_multiplier)
             font_size, sw, line_height, delimiter_len, base_length, word_lengths = calculate_font_values(font_size, words)
+        # Record the size actually drawn (post-downscale) so study-mode DOM text can match it.
+        region._drawn_font_size = font_size
 
         textlines = layout_lines_aligncenter(ballon_mask, words, word_lengths, delimiter_len, line_height, delimiter=delimiter)
 

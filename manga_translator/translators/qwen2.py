@@ -72,6 +72,41 @@ class Qwen2Translator(OfflineTranslator, ConfigGPT):
         del self.model
         del self.tokenizer
 
+    async def classify(self, texts: List[str], prompt: str) -> List[bool]:
+        """Returns True per text if flagged as explicit by the classification prompt."""
+        numbered = '\n'.join(f'{i+1}. {t}' for i, t in enumerate(texts))
+        messages = [
+            {'role': 'system', 'content': 'You are a content classifier. Follow instructions exactly.'},
+            {'role': 'user',   'content': prompt + numbered},
+        ]
+        text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        inputs = self.tokenizer(
+            [text], return_tensors='pt', padding=True, truncation=True,
+            max_length=self.tokenizer.model_max_length, return_attention_mask=True
+        ).to(self.device)
+        gen_ids = self.model.generate(
+            inputs.input_ids, attention_mask=inputs.attention_mask,
+            max_new_tokens=len(texts) * 6
+        )
+        response = self.tokenizer.batch_decode(
+            [g[len(i):] for i, g in zip(inputs.input_ids, gen_ids)],
+            skip_special_tokens=True
+        )[0]
+        self.logger.debug('-- Qwen2 classify response --\n' + response)
+
+        results = []
+        for line in response.splitlines():
+            line = line.strip().lower()
+            if re.search(r'\btrue\b', line):
+                results.append(True)
+            elif re.search(r'\bfalse\b', line):
+                results.append(False)
+        while len(results) < len(texts):
+            results.append(False)
+        return results[:len(texts)]
+
     async def _infer(self, from_lang: str, to_lang: str, queries: List[str]) -> List[str]:
         model_inputs = self.tokenize(queries, to_lang)
         # Generate the translation

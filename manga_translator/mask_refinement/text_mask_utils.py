@@ -65,10 +65,15 @@ def complete_mask_fill(text_lines: List[Tuple[int, int, int, int]]):
         final_mask = cv2.rectangle(final_mask, (x, y), (x + w, y + h), (255), -1)
     return final_mask
 
-from pydensecrf.utils import compute_unary, unary_from_softmax
-import pydensecrf.densecrf as dcrf
-
 def refine_mask(rgbimg, rawmask):
+    try:
+        from pydensecrf.utils import unary_from_softmax
+        import pydensecrf.densecrf as dcrf
+    except ImportError:
+        # pydensecrf needs a C/C++ build toolchain that isn't present on this machine.
+        # The DenseCRF pass only sharpens the inpainting mask; skipping it lowers mask
+        # quality slightly but keeps the whole translation pipeline working.
+        return rawmask[:, :, 0] if len(rawmask.shape) == 3 else rawmask
     if len(rawmask.shape) == 2:
         rawmask = rawmask[:, :, None]
     mask_softmax = np.concatenate([cv2.bitwise_not(rawmask)[:, :, None], rawmask], axis=2)

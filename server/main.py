@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import secrets
 import shutil
@@ -13,14 +14,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from fastapi import FastAPI, Request, HTTPException, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from manga_translator import Config
 from server.instance import ExecutorInstance, executor_instances
-from server.myqueue import task_queue
-from server.request_extraction import get_ctx, while_streaming, TranslateRequest, BatchTranslateRequest, get_batch_ctx
+from server.myqueue import task_queue, running_galleries, GalleryQueueElement
+from server import gallery_jobs
+from server.request_extraction import get_ctx, while_streaming, start_gallery_job, TranslateRequest, BatchTranslateRequest, get_batch_ctx
 from server.to_json import to_translation, TranslationResponse
 
 app = FastAPI()
@@ -67,6 +69,13 @@ def transform_to_json(ctx):
 
 def transform_to_bytes(ctx):
     return to_translation(ctx).to_bytes()
+
+def transform_gallery_summary(summary):
+    """Final (status 0) frame of a gallery stream: the worker returns a small dict
+    {count, failed}; the page images themselves arrive as status-5 frames. JSON-encode
+    so the client can read which page indices failed."""
+    import json
+    return json.dumps(summary if isinstance(summary, dict) else {}).encode("utf-8")
 
 @app.post("/translate/json", response_model=TranslationResponse, tags=["api", "json"],response_description="json strucure inspired by the ichigo translator extension")
 async def json(req: Request, data: TranslateRequest):
@@ -158,9 +167,59 @@ async def stream_image_form_web(req: Request, image: UploadFile = File(...), con
     conf._web_frontend_optimized = True
     return await while_streaming(req, transform_to_image, conf, img)
 
+@app.post("/translate/gallery/start", tags=["api", "form", "batch"], response_description="Create a server-owned gallery job and return immediately with its token; collect results via /translate/gallery/poll.")
+async def start_gallery(req: Request, image: list[UploadFile] = File(...), config: str = Form("{}"), batch_size: int = Form(0), job_token: str = Form("")) -> dict:
+    images = [await f.read() for f in image]
+    conf = Config.parse_raw(config)
+    return await start_gallery_job(req, transform_gallery_summary, conf, images, batch_size, job_token)
+
+@app.post("/translate/gallery/poll", response_class=Response, tags=["api", "batch"], response_description="Short poll. Body = a status-7 metadata frame (JSON {cursor,status,state,done,total}) + the page/study frames produced past `since` + the terminal frame once present. All in the body (not headers) so it survives cross-origin reads.")
+async def poll_gallery(job_token: str = Form(...), since: int = Form(0)) -> Response:
+    job = gallery_jobs.get(job_token)
+    if job is None:
+        # Reaped (abandoned past the grace window), evicted after finishing, or lost to a restart.
+        return Response(content=gallery_jobs.GalleryJob.notfound_body(since), media_type="application/octet-stream")
+    return Response(content=job.poll(since), media_type="application/octet-stream")
+
+@app.post("/translate/gallery/cancel", tags=["api"])
+async def cancel_gallery(job_token: str = Form(...)):
+    """Explicitly cancel a gallery job by its client-issued token. Marks the job cancelled in
+    the chunk scheduler (waiting, between chunks, or mid-chunk — no further chunks dispatch),
+    cancels a still-queued chunk element, and forwards a token-scoped cancel to the worker
+    when a chunk is running. Identity-correct: it can never abort a different gallery."""
+    logging.getLogger('gallery-jobs').info(f'Gallery job {job_token[:8]}… cancelled by client request')
+    known = gallery_jobs.cancel(job_token)
+    inst = running_galleries.get(job_token)
+    if inst is not None:
+        await inst.cancel_gallery(job_token)
+        return {"cancelling": True}
+    for task in list(task_queue.queue):
+        if isinstance(task, GalleryQueueElement) and getattr(task, 'job_token', '') == job_token:
+            task.cancelled = True
+            await task_queue.update_event()
+            return {"cancelling": True, "queued": True}
+    return {"cancelling": known}
+
 @app.post("/queue-size", response_model=int, tags=["api", "json"])
 async def queue_size() -> int:
     return len(task_queue.queue)
+
+@app.post("/reset-context", tags=["api"])
+async def reset_context():
+    """Clear the worker's accumulated cross-page context. Call before translating a new
+    gallery so the previous title's pages aren't used as context."""
+    import aiohttp, pickle
+    payload = pickle.dumps({})
+    ok = 0
+    for inst in executor_instances.list:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(f"http://{inst.ip}:{inst.port}/simple_execute/reset_page_context", data=payload) as r:
+                    if r.status == 200:
+                        ok += 1
+        except Exception:
+            pass
+    return {"ok": True, "instances_reset": ok}
 
 
 @app.api_route("/result/{folder_name}/final.png", methods=["GET", "HEAD"], tags=["api", "file"])
@@ -260,6 +319,8 @@ def start_translator_client_proc(host: str, port: int, nonce: str, params: Names
         cmds.append('--verbose')
     if params.models_ttl:
         cmds.append('--models-ttl=%s' % params.models_ttl)
+    if getattr(params, 'context_size', 0):
+        cmds.append('--context-size=%s' % params.context_size)
     if getattr(params, 'pre_dict', None):
         cmds.extend(['--pre-dict', params.pre_dict])
     if getattr(params, 'post_dict', None):

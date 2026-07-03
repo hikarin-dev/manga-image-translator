@@ -17,6 +17,7 @@ from .generic import (
     get_digest,
     get_filename_from_url,
 )
+from .executors import submit_gpu
 from .log import get_logger
 from ..config import TranslatorConfig
 
@@ -332,7 +333,9 @@ class ModelWrapper(ABC):
         if not self.is_downloaded():
             await self.download()
         if not self.is_loaded():
-            await self._load(*args, **kwargs, device=device)
+            # Allocate/move the model on its GPU lane so every CUDA op of this model —
+            # load and inference alike — shares that one thread.
+            await submit_gpu(self._load(*args, **kwargs, device=device), self._GPU_LANE)
             self._loaded = True
 
     async def unload(self):
@@ -340,14 +343,31 @@ class ModelWrapper(ABC):
             await self._unload()
             self._loaded = False
 
+    # Set True on models whose _infer orchestrates its own thread placement (CPU-pool
+    # pre/post + GPU-thread forward). The blanket GPU-thread submit below would otherwise
+    # run their host-side pre/post processing on the GPU thread, serializing it with
+    # every other model's kernels.
+    _SELF_ORCHESTRATED = False
+    # Which GPU worker lane this model's kernels (and load) run on. A model is pinned to
+    # one lane, so its own op order — and therefore its output — is unchanged; separate
+    # lanes only let DIFFERENT models overlap (e.g. detection kernels filling the host
+    # gaps of the OCR beam loop).
+    _GPU_LANE = 0
+
     async def infer(self, *args, **kwargs):
         '''
         Makes a forward pass through the network.
         '''
         if not self.is_loaded():
             raise Exception(f'{self._key}: Tried to forward pass without having loaded the model.')
-        
-        return await self._infer(*args, **kwargs)
+
+        if self._SELF_ORCHESTRATED:
+            return await self._infer(*args, **kwargs)
+
+        # Run the forward pass on the dedicated GPU worker thread (off the main event
+        # loop) so detection/OCR/inpainting no longer block — or get blocked by — CPU
+        # rendering happening concurrently for another page.
+        return await submit_gpu(self._infer(*args, **kwargs), self._GPU_LANE)
 
     @abstractmethod
     async def _load(self, device: str, *args, **kwargs):

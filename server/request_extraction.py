@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from manga_translator import Config
 from server.myqueue import task_queue, wait_in_queue, QueueElement, BatchQueueElement
 from server.streaming import notify, stream
+from server import gallery_jobs
 
 class TranslateRequest(BaseModel):
     """This request can be a multipart or a json request"""
@@ -71,6 +72,22 @@ async def while_streaming(req: Request, transform, config: Config, image: bytes 
     streaming_response = StreamingResponse(stream(messages), media_type="application/octet-stream")
     asyncio.create_task(wait_in_queue(task, notify_internal))
     return streaming_response
+
+async def start_gallery_job(req: Request, transform, config: Config, images: list[bytes | str], batch_size: int = 0, job_token: str = ""):
+    """Polling model: create the server-owned job and hand it to the chunk scheduler, then
+    return IMMEDIATELY. The scheduler dispatches the job to the worker one chunk of pages at
+    a time (rotating chunks between concurrent jobs — see gallery_jobs), buffering every frame
+    into the job; the client collects them with short /translate/gallery/poll requests instead
+    of holding one long stream open (which a service worker can't, because of the ~5-min
+    per-event lifetime cap). Idempotent on job_token."""
+    existing = gallery_jobs.get(job_token)
+    if existing is not None:
+        return {"token": job_token, "started": True, "existing": True}
+
+    job = gallery_jobs.create(job_token)
+    job.total = len(images)               # authoritative page count for the poll progress bar
+    gallery_jobs.submit(job, req, images, config, batch_size, transform)
+    return {"token": job_token, "started": True}
 
 async def get_batch_ctx(req: Request, config: Config, images: list[str|bytes], batch_size: int = 4):
     """Process batch translation request"""
