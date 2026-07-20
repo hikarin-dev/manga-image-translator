@@ -47,6 +47,15 @@ def parse_arguments():
     parser.add_argument('--context-size', default=0, type=int, help='Pages of previous translations to feed LLM translators as context')
     parser.add_argument('--pre-dict', default=None, type=file_path, help='Path to the pre-translation dictionary file')
     parser.add_argument('--post-dict', default=None, type=file_path, help='Path to the post-translation dictionary file')    
+    parser.add_argument('--aux', action='store_true',
+                        help='Run as an auxiliary worker node instead of a server: start a local '
+                             'worker and join the main server given by --join to take its gallery work')
+    parser.add_argument('--join', type=str, default=os.getenv('MT_AUX_JOIN') or None,
+                        help='[--aux] URL of the main server to join, e.g. https://translate.example.com')
+    parser.add_argument('--aux-token', type=str, default=os.getenv('MT_AUX_TOKEN') or None,
+                        help='[--aux] Shared join secret; must match MT_AUX_TOKEN on the main server')
+    parser.add_argument('--aux-name', type=str, default=os.getenv('MT_AUX_NAME') or None,
+                        help='[--aux] Name for this node in the main server log (default: hostname)')
     g = parser.add_mutually_exclusive_group()
     g.add_argument('--use-gpu', action='store_true', help='Turn on/off gpu (auto switch between mps and cuda)')
     g.add_argument('--use-gpu-limited', action='store_true', help='Turn on/off gpu (excluding offline translator)')

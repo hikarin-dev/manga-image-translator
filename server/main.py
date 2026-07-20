@@ -12,13 +12,16 @@ import asyncio
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
-from fastapi import FastAPI, Request, HTTPException, Header, UploadFile, File, Form
+from fastapi import FastAPI, Request, HTTPException, Header, UploadFile, File, Form, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from manga_translator import Config
+from server import aux_pool
+from server import edge
+from server import stats
 from server.instance import ExecutorInstance, executor_instances
 from server.myqueue import task_queue, running_galleries, GalleryQueueElement
 from server import gallery_jobs
@@ -32,10 +35,13 @@ BASE_DIR = Path(__file__).resolve().parent
 RESULT_ROOT = (BASE_DIR.parent / "result").resolve()
 RESULT_ROOT.mkdir(parents=True, exist_ok=True)
 
+# EdgeGate first so CORSMiddleware (added after = outermost) still stamps CORS headers on
+# its rejections — the browser can't read a 401/413 body without them.
+app.add_middleware(edge.EdgeGate)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=edge.ALLOWED_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -50,6 +56,20 @@ async def register_instance(instance: ExecutorInstance, req: Request, req_nonce:
         raise HTTPException(401, detail="Invalid nonce")
     instance.ip = req.client.host
     executor_instances.register(instance)
+
+@app.websocket("/aux/join")
+async def aux_join(ws: WebSocket):
+    """Auxiliary worker nodes dial in here and are added to the executor pool.
+
+    Deliberately reachable from outside: an aux node is remote by definition, and EdgeGate
+    only filters HTTP scopes. The join token (constant-time compared, unset by default) is
+    the gate — unlike /register, no request from here can name an address we then dial."""
+    await aux_pool.handle_join(ws)
+
+@app.get("/aux/nodes", tags=["internal-api"])
+async def aux_nodes() -> dict:
+    """Which nodes are in the pool right now. Local-only: not in edge.PUBLIC_PATHS."""
+    return {"executors": aux_pool.nodes()}
 
 def transform_to_image(ctx):
     # 检查是否使用占位符（在web模式下final.png保存后会设置此标记）
@@ -167,10 +187,35 @@ async def stream_image_form_web(req: Request, image: UploadFile = File(...), con
     conf._web_frontend_optimized = True
     return await while_streaming(req, transform_to_image, conf, img)
 
-@app.post("/translate/gallery/start", tags=["api", "form", "batch"], response_description="Create a server-owned gallery job and return immediately with its token; collect results via /translate/gallery/poll.")
-async def start_gallery(req: Request, image: list[UploadFile] = File(...), config: str = Form("{}"), batch_size: int = Form(0), job_token: str = Form("")) -> dict:
+@app.post("/translate/gallery/start", tags=["api", "form", "batch"], response_description="Create a server-owned gallery job and return immediately with its token; collect results via /translate/gallery/poll. A big gallery may arrive as several requests sharing one token (part k of n) — the job starts when the last part lands.")
+async def start_gallery(req: Request, image: list[UploadFile] = File(...), config: str = Form("{}"), batch_size: int = Form(0), job_token: str = Form(""), part: int = Form(0), parts: int = Form(1)) -> dict:
     images = [await f.read() for f in image]
+    external = bool(getattr(req.state, "external", False))
+    client_ip = str(getattr(req.state, "client_ip", "") or "")
+    if external:
+        err = edge.validate_pages(images)
+        if err:
+            raise HTTPException(413, detail=err)
     conf = Config.parse_raw(config)
+    if parts > 1:
+        if not (job_token and 1 < parts <= 200 and 0 <= part < parts):
+            raise HTTPException(400, detail="bad part/parts")
+        status, assembled = gallery_jobs.add_upload_part(
+            job_token, part, parts, images, client_ip,
+            max_pages=edge.MAX_PAGES_PER_JOB if external else 0)
+        if status == 'exists':
+            return {"token": job_token, "started": True, "existing": True}
+        if status == 'busy':
+            raise HTTPException(503, detail="server is busy — try again in a few minutes")
+        if status == 'too_many_pages':
+            raise HTTPException(413, detail=f"too many pages (max {edge.MAX_PAGES_PER_JOB} per translation)")
+        if status == 'pending':
+            return {"token": job_token, "part": part, "received": True}
+        images = assembled
+    if external:
+        rejected = edge.check_admission(client_ip, len(images))
+        if rejected:
+            raise HTTPException(rejected[0], detail=rejected[1])
     return await start_gallery_job(req, transform_gallery_summary, conf, images, batch_size, job_token)
 
 @app.post("/translate/gallery/poll", response_class=Response, tags=["api", "batch"], response_description="Short poll. Body = a status-7 metadata frame (JSON {cursor,status,state,done,total}) + the page/study frames produced past `since` + the terminal frame once present. All in the body (not headers) so it survives cross-origin reads.")
@@ -189,20 +234,33 @@ async def cancel_gallery(job_token: str = Form(...)):
     when a chunk is running. Identity-correct: it can never abort a different gallery."""
     logging.getLogger('gallery-jobs').info(f'Gallery job {job_token[:8]}… cancelled by client request')
     known = gallery_jobs.cancel(job_token)
-    inst = running_galleries.get(job_token)
-    if inst is not None:
+    # A job's chunks can be running on several executors at once, and others can still be
+    # queued — reach every one of them, not just the first found.
+    holders = running_galleries.get(job_token) or ()
+    for inst in list(holders):
         await inst.cancel_gallery(job_token)
-        return {"cancelling": True}
+    queued = False
     for task in list(task_queue.queue):
         if isinstance(task, GalleryQueueElement) and getattr(task, 'job_token', '') == job_token:
             task.cancelled = True
-            await task_queue.update_event()
-            return {"cancelling": True, "queued": True}
+            queued = True
+    if queued:
+        await task_queue.update_event()
+    if holders or queued:
+        return {"cancelling": True, "queued": queued}
     return {"cancelling": known}
 
 @app.post("/queue-size", response_model=int, tags=["api", "json"])
 async def queue_size() -> int:
     return len(task_queue.queue)
+
+@app.get("/stats", tags=["api"])
+async def service_stats() -> dict:
+    """Operator metrics: queue depth, today's jobs/pages, GPU state, recent job summaries.
+    Externally reachable (token-gated by the edge middleware); per-job history persists in
+    logs/jobs.jsonl."""
+    gpu = await asyncio.to_thread(stats.gpu_snapshot)
+    return stats.snapshot(gpu)
 
 @app.post("/reset-context", tags=["api"])
 async def reset_context():
@@ -452,6 +510,14 @@ if __name__ == '__main__':
     from args import parse_arguments
 
     args = parse_arguments()
+
+    if args.aux:
+        # Auxiliary node: no public API, no job store, no scheduler — just a local worker and
+        # the relay that feeds it from the main server. Exits non-zero on a fatal join refusal
+        # (bad token / protocol / version) so a supervisor doesn't loop on it forever.
+        from server import aux_agent
+        sys.exit(asyncio.run(aux_agent.run(args)))
+
     args.start_instance = True
     proc = prepare(args)
     print("Nonce: "+nonce)

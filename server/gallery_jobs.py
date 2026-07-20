@@ -15,16 +15,29 @@ This is the standard async request/reply (job-as-a-resource) pattern, scoped to 
 import asyncio
 import json
 import logging
-import math
 import pickle
 import re
 import time
 
+from server import safe_pickle
+from server.instance import executor_instances
+
 logger = logging.getLogger('gallery-jobs')
+# The main server (server/main.py) runs under uvicorn and never calls the worker's
+# init_logging(), so the root logger stays at WARNING with no INFO console handler — our
+# INFO lines (chunk dispatch, and the one folded gallery-level summary) would be dropped
+# before printing, leaving only the worker's per-chunk logs visible. Give this module its
+# own stdout handler at INFO so those always surface, without mutating global logging.
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter('%(levelname)s: [gallery-jobs] %(message)s'))
+    logger.addHandler(_h)
+    logger.propagate = False
 
 # Pipeline progress strings the worker emits as status-1 frames (longest alt first so 'tl-done'
-# isn't shadowed by 'tl'): gallery-pre:k/n (reading), gallery-tl:b/m (translating a batch),
-# gallery-tl-done:b/m (a batch finished).
+# isn't shadowed by 'tl'). All three are in PAGE units: gallery-pre:k/n (pages read),
+# gallery-tl:a/n (pages whose translation started), gallery-tl-done:a/n (pages translated).
 _STATE_RE = re.compile(r'^gallery-(pre|tl-done|tl):(\d+)/(\d+)$')
 
 # A running job is cancelled after this long with no poll. The service-worker poll loop polls every
@@ -56,9 +69,9 @@ class GalleryJob:
         # Furthest progress reached in each pipeline stage (the stages overlap, so we keep the max
         # of each rather than the single latest frame) — lets the client show an accurate label.
         self.pre = 0                  # pages whose text has been read (detect + OCR)
-        self.tl_started = 0           # translation batches started
-        self.tl_done = 0              # translation batches finished
-        self.batches = 0              # total translation batches
+        self.tl_started = 0           # pages whose translation request has started
+        self.tl_done = 0              # pages whose translation has finished
+        self.batches = 0              # denominator of the tl progress (total pages)
         self.queue = 0                # queue position while waiting for a worker (status-3)
         self.dispatched = False       # a worker picked the job up (status-4)
         self.status = 'running'       # running | done | error | cancelled
@@ -141,6 +154,64 @@ _jobs: dict[str, GalleryJob] = {}
 _reaper_started = False
 
 
+# ── multi-part uploads ───────────────────────────────────────────────────────────────────
+# Cloudflare's free tier caps a request body at ~100MB, so the app uploads a big gallery as
+# several /translate/gallery/start requests sharing one job token (part k of n). Parts
+# buffer here and the job is created only when the last one lands; an upload that never
+# completes is reaped after UPLOAD_TTL_S.
+UPLOAD_TTL_S = 300.0
+MAX_PENDING_UPLOADS = 6
+MAX_UPLOAD_BUFFER_BYTES = 1024 * 1024 * 1024   # all pending parts together
+
+
+class _PendingUpload:
+    def __init__(self, token: str, parts: int, owner_ip: str):
+        self.token = token
+        self.parts = parts
+        self.owner_ip = owner_ip
+        self.got: dict[int, list] = {}
+        self.created = time.monotonic()
+
+    @property
+    def pages(self) -> int:
+        return sum(len(imgs) for imgs in self.got.values())
+
+    @property
+    def bytes(self) -> int:
+        return sum(len(b) for imgs in self.got.values() for b in imgs)
+
+
+_uploads: dict[str, _PendingUpload] = {}
+
+
+def add_upload_part(token: str, part: int, parts: int, images: list, owner_ip: str = '',
+                    max_pages: int = 0) -> tuple[str, list | None]:
+    """Buffer one upload part; idempotent per (token, part). Returns (status, images):
+    'exists' (job already created — a retry of an already-processed final part), 'busy'
+    (buffer full), 'too_many_pages', 'pending' (more parts expected), or 'done' with the
+    full gallery assembled in part order."""
+    up = _uploads.get(token)
+    if up is None:
+        if get(token) is not None:
+            return 'exists', None
+        total_bytes = sum(u.bytes for u in _uploads.values())
+        if len(_uploads) >= MAX_PENDING_UPLOADS or total_bytes >= MAX_UPLOAD_BUFFER_BYTES:
+            return 'busy', None
+        up = _uploads[token] = _PendingUpload(token, max(1, int(parts)), owner_ip)
+        _ensure_reaper()
+    up.got[int(part)] = images
+    if max_pages and up.pages > max_pages:
+        _uploads.pop(token, None)
+        return 'too_many_pages', None
+    if len(up.got) < up.parts:
+        return 'pending', None
+    _uploads.pop(token, None)
+    ordered: list = []
+    for k in sorted(up.got):
+        ordered.extend(up.got[k])
+    return 'done', ordered
+
+
 def get(token: str) -> GalleryJob | None:
     return _jobs.get(token) if token else None
 
@@ -180,6 +251,12 @@ async def _reap_loop() -> None:
                 ref = job.done_at or job.last_poll
                 if (now - ref) > DONE_RETENTION_S:
                     _jobs.pop(token, None)
+        for token, up in list(_uploads.items()):
+            if (now - up.created) > UPLOAD_TTL_S:
+                _uploads.pop(token, None)
+                logger.warning(
+                    f'Gallery upload {token[:8]}… reaped: incomplete after {UPLOAD_TTL_S:.0f}s '
+                    f'({len(up.got)}/{up.parts} parts, {up.pages} pages buffered)')
 
 
 # ── multi-tenant chunk scheduler ─────────────────────────────────────────────────────────
@@ -203,6 +280,10 @@ ACTIVE_MAX = 3
 SOLO_CHUNK = 48
 SHARED_CHUNK = 16
 WEIGHT_OLDEST = 2
+# How many times a job may have a chunk come back having delivered no pages at all before we
+# stop retrying and fail it. Guards against a permanently broken executor spinning forever;
+# any chunk that delivers even one page resets the count.
+MAX_CHUNK_STALLS = 3
 
 _UNCHUNKABLE_TRANSLATORS = ('chatgpt', 'chatgpt_2stage')
 
@@ -214,6 +295,10 @@ class _SchedJob:
     def __init__(self, job, req, images, config, batch_size, transform):
         self.job = job
         self.req = req
+        try:
+            self.owner_ip = str(getattr(req.state, 'client_ip', '') or '')  # set by server.edge
+        except Exception:
+            self.owner_ip = ''
         self.images = images
         self.config = config
         self.batch_size = int(batch_size) if batch_size else 0
@@ -222,12 +307,134 @@ class _SchedJob:
         self.next_page = 0
         self.failed: list[int] = []
         self.cancelled = False
+        # Chunks of one job can run on several executors at once, so outstanding work is not a
+        # single cursor. `retry` holds page ranges an executor dropped mid-chunk (re-dispatched
+        # ahead of any fresh pages), `inflight` the chunks running right now, and `emitted` the
+        # job-absolute pages already delivered. A job is complete only when all three are clear.
+        self.retry: list[tuple[int, int]] = []
+        self.inflight: set = set()
+        self.emitted: set[int] = set()
+        self.stalls = 0               # consecutive chunk failures that delivered no page at all
+        # Gallery-level telemetry, folded from each chunk's summary so a multi-chunk
+        # job reports ONE final result instead of e.g. 40/40 followed by 19/19.
+        self.submitted_at = time.monotonic()
+        self.chunks_done = 0
+        self.tel_wall = 0.0                    # summed chunk walls (compute time, excludes queue gaps)
+        self.tel_emitted = 0
+        self.tel_study_meta = 0
+        self.tel_study_image = 0
+        self.tel_bubbles = 0
+        self.tel_cancelled = False
+        self.tel_stages: dict[str, float] = {}
+        self.tel_waits: dict[str, float] = {}
+        self.tel_gpu: list[tuple[float, float]] = []   # (avg, chunk wall) → wall-weighted average
+        self.tel_cpu: list[tuple[float, float]] = []
+        self.tel_gpu_max = 0.0
+        self.tel_cpu_max = 0.0
+        self.tel_vram_max = 0.0
+        self.tel_vram_total = 0.0
+        # LLM request/token accounting (summed across chunks; cost is additive, max_wall is a max).
+        self.tel_llm_requests = 0
+        self.tel_llm_in = 0
+        self.tel_llm_out = 0
+        self.tel_llm_cache_hit = 0
+        self.tel_llm_cache_miss = 0
+        self.tel_llm_cost = 0.0
+        self.tel_llm_max_wall = 0.0
+
+    def fold_telemetry(self, tel: dict) -> None:
+        if not isinstance(tel, dict):
+            return
+        self.chunks_done += 1
+        llm = tel.get('llm') or {}
+        if llm:
+            self.tel_llm_requests += int(llm.get('requests', 0))
+            self.tel_llm_in += int(llm.get('in', 0))
+            self.tel_llm_out += int(llm.get('out', 0))
+            self.tel_llm_cache_hit += int(llm.get('cache_hit', 0))
+            self.tel_llm_cache_miss += int(llm.get('cache_miss', 0))
+            self.tel_llm_cost += float(llm.get('cost', 0.0))
+            self.tel_llm_max_wall = max(self.tel_llm_max_wall, float(llm.get('max_wall', 0.0)))
+        wall = float(tel.get('wall') or 0.0)
+        self.tel_wall += wall
+        self.tel_emitted += int(tel.get('emitted') or 0)
+        self.tel_study_meta += int(tel.get('study_meta') or 0)
+        self.tel_study_image += int(tel.get('study_image') or 0)
+        self.tel_bubbles += int(tel.get('bubbles') or 0)
+        self.tel_cancelled = self.tel_cancelled or bool(tel.get('cancelled'))
+        for k, v in (tel.get('stage_times') or {}).items():
+            self.tel_stages[k] = self.tel_stages.get(k, 0.0) + float(v)
+        for k, v in (tel.get('queue_wait') or {}).items():
+            self.tel_waits[k] = self.tel_waits.get(k, 0.0) + float(v)
+        if tel.get('gpu_avg') or tel.get('gpu_max'):
+            self.tel_gpu.append((float(tel.get('gpu_avg') or 0.0), wall))
+            self.tel_gpu_max = max(self.tel_gpu_max, float(tel.get('gpu_max') or 0.0))
+        if tel.get('cpu_avg') or tel.get('cpu_max'):
+            self.tel_cpu.append((float(tel.get('cpu_avg') or 0.0), wall))
+            self.tel_cpu_max = max(self.tel_cpu_max, float(tel.get('cpu_max') or 0.0))
+        self.tel_vram_max = max(self.tel_vram_max, float(tel.get('vram_max') or 0.0))
+        self.tel_vram_total = max(self.tel_vram_total, float(tel.get('vram_total') or 0.0))
+
+    def summary_line(self) -> str:
+        """The ONE gallery-level completion summary, folded across every chunk of this
+        job_token. Reported as whole-gallery totals (59/59, not 40/40 then 19/19)."""
+        def wavg(pairs):
+            tw = sum(w for _, w in pairs)
+            return (sum(a * w for a, w in pairs) / tw) if tw else 0.0
+        since_submit = time.monotonic() - self.submitted_at
+        failed = len(set(self.failed))
+        summed = sum(self.tel_stages.values())
+        # since_submit is real end-to-end (includes any scheduler queue waits between chunks);
+        # tel_wall is summed on-GPU compute. Throughput uses the real wall; overlap uses compute.
+        wall = since_submit or self.tel_wall
+        stages = ', '.join(f'{k}={v:.1f}' for k, v in sorted(self.tel_stages.items(), key=lambda kv: -kv[1])) or 'n/a'
+        waits = ', '.join(f'{k}={v:.1f}' for k, v in sorted(self.tel_waits.items(), key=lambda kv: -kv[1])) or 'n/a'
+        gpu = (f'GPU avg={wavg(self.tel_gpu):.0f}% max={self.tel_gpu_max:.0f}%' if self.tel_gpu else 'GPU n/a')
+        vram = (f'VRAM max={self.tel_vram_max:.0f}MB' + (f'/{self.tel_vram_total:.0f}MB' if self.tel_vram_total else '')
+                if self.tel_vram_max else 'VRAM n/a')
+        cpu = (f'CPU avg={wavg(self.tel_cpu):.0f}% max={self.tel_cpu_max:.0f}%' if self.tel_cpu else 'CPU n/a')
+        llm_line = ''
+        if self.tel_llm_requests:
+            in_tok, out_tok = self.tel_llm_in, self.tel_llm_out
+            hit = self.tel_llm_cache_hit
+            hit_pct = (100.0 * hit / in_tok) if in_tok else 0.0
+            llm_line = (
+                f'\n  LLM: {self.tel_llm_requests} requests, in={in_tok} (cache hit {hit_pct:.0f}%) '
+                f'out={out_tok} tok, slowest request={self.tel_llm_max_wall:.1f}s, ~${self.tel_llm_cost:.4f} est')
+        return (
+            f'Gallery job {self.job.token[:8]}… summary: {self.tel_emitted}/{self.total} pages emitted, '
+            f'{failed} failed, {self.chunks_done} chunk(s)'
+            + (' — CANCELLED' if self.tel_cancelled else '') + '\n'
+            f'  compute={self.tel_wall:.1f}s wall={since_submit:.1f}s '
+            f'overlap={(summed / self.tel_wall if self.tel_wall else 1):.2f}x '
+            f'pages/sec={(self.tel_emitted / wall if wall else 0):.2f} '
+            f'per_page={(wall / self.total if self.total else 0):.2f}s '
+            f'study_pages(meta={self.tel_study_meta}, image={self.tel_study_image}) bubbles={self.tel_bubbles}'
+            + llm_line + '\n'
+            f'  stages(s): {stages}\n'
+            f'  queue_wait(s): {waits}\n'
+            f'  {gpu} | {vram} | {cpu}')
 
     @property
-    def finished(self) -> bool:
-        return self.next_page >= self.total
+    def has_work(self) -> bool:
+        """Pages still to hand out — either a dropped range to redo or fresh pages."""
+        return bool(self.retry) or self.next_page < self.total
 
-    def chunk_size(self, solo: bool) -> int:
+    @property
+    def complete(self) -> bool:
+        return not self.has_work and not self.inflight
+
+    def take_range(self, solo: bool, split: int = 1) -> tuple[int, int]:
+        """Claim the next page range to dispatch. Dropped ranges go first so a failed chunk is
+        redone promptly rather than after the whole rest of the gallery."""
+        if self.retry:
+            return self.retry.pop(0)
+        start = self.next_page
+        end = start + self.chunk_size(solo, split)
+        self.next_page = end
+        return start, end
+
+    def chunk_size(self, solo: bool, split: int = 1) -> int:
         remaining = self.total - self.next_page
         tr = str(getattr(self.config.translator, 'translator', ''))
         if tr in _UNCHUNKABLE_TRANSLATORS:
@@ -235,6 +442,15 @@ class _SchedJob:
         cap = self.batch_size if self.batch_size > 0 else remaining
         base = SOLO_CHUNK if solo else SHARED_CHUNK
         pages = max(cap, (base // max(1, cap)) * max(1, cap))
+        if split > 1:
+            # Several executors are free and this job is the only claimant. A typical gallery
+            # is smaller than one chunk, so without this it would be handed to a single machine
+            # whole and the rest of the pool would idle through it. Still whole multiples of the
+            # batch cap, so translation batches group exactly as in an unchunked run. (With
+            # batch_size 0 the cap IS the remainder, so this leaves that case untouched.)
+            share = -(-remaining // split)
+            share = max(cap, (share // max(1, cap)) * max(1, cap))
+            pages = min(pages, share)
         return min(pages, remaining)
 
 
@@ -242,6 +458,36 @@ _sched: dict[str, _SchedJob] = {}
 _sched_order: list[str] = []
 _sched_event = asyncio.Event()
 _sched_started = False
+
+
+def live_job_count() -> int:
+    """Jobs the scheduler owns (running + waiting) — the admission-control depth."""
+    return len(_sched)
+
+
+def live_jobs_for_ip(ip: str) -> int:
+    """Live jobs plus in-progress multi-part uploads owned by one external client."""
+    return (sum(1 for sj in _sched.values() if getattr(sj, 'owner_ip', '') == ip)
+            + sum(1 for up in _uploads.values() if up.owner_ip == ip))
+
+
+def queue_snapshot() -> dict:
+    live = [t for t in _sched_order if t in _sched]
+    return {'live_jobs': len(live), 'active': min(len(live), ACTIVE_MAX),
+            'waiting': max(0, len(live) - ACTIVE_MAX), 'uploads_pending': len(_uploads)}
+
+
+def _record(sj: _SchedJob, cancelled: bool = False) -> None:
+    """Fold a retired job into the metrics exactly once (a cancel can race the final
+    chunk's summary — whichever path retires the job first wins)."""
+    if getattr(sj, '_recorded', False):
+        return
+    sj._recorded = True
+    try:
+        from server import stats
+        stats.record_job(sj, cancelled=cancelled)
+    except Exception:
+        pass
 
 
 def submit(job: GalleryJob, req, images, config, batch_size, transform) -> None:
@@ -282,6 +528,9 @@ def _pick_next() -> "_SchedJob | None":
     # Waiting list: expose how many jobs are ahead so clients show a queue position.
     for i, token in enumerate(live[ACTIVE_MAX:]):
         _sched[token].job.queue = i + 1
+    # A job whose pages are all handed out is still active (its chunks are running) but has
+    # nothing left to give — skip it so it can't consume a rotation slot or an executor.
+    active = [t for t in active if _sched[t].has_work]
     if not active:
         return None
     for k, token in enumerate(active):
@@ -294,9 +543,11 @@ def _pick_next() -> "_SchedJob | None":
     return _sched[active[0]]
 
 
-def _make_adapter(sj: _SchedJob, chunk_start: int, final: bool):
+def _make_adapter(sj: _SchedJob, chunk_start: int, state: dict):
     """Per-chunk notify sink: rewrites chunk-local frames into job-absolute ones before
-    they land in the job buffer, and merges intermediate summaries."""
+    they land in the job buffer, and merges intermediate summaries. Never emits the job's
+    terminal frame — with chunks in flight on several executors, only _maybe_finish knows
+    when the last page has actually landed."""
     from server.streaming import notify
 
     def adapter(code: int, data: bytes) -> None:
@@ -306,29 +557,39 @@ def _make_adapter(sj: _SchedJob, chunk_start: int, final: bool):
             b = 1 + tlen
             idx = int.from_bytes(data[b:b + 4], 'big') + chunk_start
             data = data[:b] + idx.to_bytes(4, 'big') + data[b + 4:]
+            if code == 5:
+                # Delivered pages: what a failed chunk must NOT redo, and what tells the
+                # scheduler the job is done.
+                sj.emitted.add(idx)
             notify(code, data, sj.transform, sj.job)
         elif code == 1:
             s = data.decode('utf-8', 'ignore')
             mm = _STATE_RE.match(s)
             if mm:
+                # All three progress kinds are page-based (a/n within the chunk) —
+                # offset into job-absolute pages uniformly.
                 kind, a = mm.group(1), int(mm.group(2))
-                if kind == 'pre':
-                    s = f'gallery-pre:{chunk_start + a}/{sj.total}'
-                elif sj.batch_size > 0:
-                    base_b = chunk_start // sj.batch_size
-                    m_total = math.ceil(sj.total / sj.batch_size)
-                    s = f'gallery-{kind}:{base_b + a}/{m_total}'
+                s = f'gallery-{kind}:{chunk_start + a}/{sj.total}'
             notify(1, s.encode('utf-8'), sj.transform, sj.job)
         elif code == 0:
             try:
-                summary = pickle.loads(data)
-            except Exception:
+                # An executor may be an aux node on someone else's machine — never hand its
+                # bytes to bare pickle.loads (see server.safe_pickle).
+                summary = safe_pickle.loads(data)
+            except Exception as e:
+                logger.warning(f'Gallery job {sj.job.token[:8]}… discarding unreadable chunk summary: {e}')
                 summary = {}
             if isinstance(summary, dict):
                 sj.failed.extend(chunk_start + int(i) for i in summary.get('failed', []))
-            if final:
-                notify(0, pickle.dumps({'count': sj.total, 'failed': sorted(set(sj.failed))}), sj.transform, sj.job)
-            # non-final chunk summaries are folded, never emitted — the job is still running
+                sj.fold_telemetry(summary.get('telemetry'))
+            # Chunk summaries are only ever folded. The job's own terminal frame is emitted by
+            # _maybe_finish once every chunk — including any that had to be redone — is in.
+        elif code == 2:
+            # An executor failing is NOT the job's terminal state — these pages can still go to
+            # another one. wait_in_queue reports a dead executor by calling us with a status-2
+            # frame, and forwarding that would mark the whole gallery errored and finished
+            # before failover ever ran. Record it for _run_chunk; only _fail() ends the job.
+            state['error'] = data.decode('utf-8', 'ignore') or 'executor failed'
         else:
             # 2 = error (terminal), 3/4 = queue position / dispatched — pass through
             notify(code, data, sj.transform, sj.job)
@@ -345,58 +606,149 @@ def _drop(token: str) -> None:
         pass
 
 
+_inflight_chunks = 0    # chunks running across the whole pool, the concurrency accounting
+
+
+def _maybe_finish(sj: _SchedJob) -> None:
+    """Emit the job's one terminal frame, once every page has actually landed. With chunks in
+    flight on several executors the last chunk to return is not necessarily the one carrying
+    the last page, so completion is decided here rather than at dispatch time."""
+    if sj.job.status != 'running' or not sj.complete:
+        return
+    from server.streaming import notify
+    logger.info(sj.summary_line())
+    _record(sj)
+    notify(0, pickle.dumps({'count': sj.total, 'failed': sorted(set(sj.failed))}), sj.transform, sj.job)
+    _drop(sj.job.token)
+
+
+def _fail(sj: _SchedJob, detail: str) -> None:
+    """Give up on a job whose pages can't be delivered. Cancels its siblings first so no chunk
+    keeps running for a job the client has already been told failed."""
+    from server.streaming import notify
+    sj.cancelled = True
+    logger.error(f'Gallery job {sj.job.token[:8]}… giving up: {detail}')
+    notify(2, f'Translation failed: {detail}'.encode('utf-8'), sj.transform, sj.job)
+    _record(sj)
+    _drop(sj.job.token)
+
+
+def _dispatch(sj: _SchedJob, start: int, end: int):
+    """Register a chunk and queue it. The accounting happens here, synchronously, so a chunk
+    counts as in flight the moment it is scheduled rather than when its task first runs — a
+    sibling finishing in that gap would otherwise see an empty inflight set and declare the
+    whole job complete."""
+    from server.myqueue import task_queue, GalleryQueueElement
+    global _inflight_chunks
+    element = GalleryQueueElement(sj.req, sj.images[start:end], sj.config, sj.batch_size,
+                                  sj.job.token, parent=sj)
+    element.cancelled = sj.cancelled
+    sj.inflight.add(element)
+    _inflight_chunks += 1
+    task_queue.add_task(element)
+    return element
+
+
+async def _run_chunk(sj: _SchedJob, element, start: int, end: int) -> None:
+    """Own one chunk end to end: await it, then either retire its pages or hand the
+    un-delivered remainder back to the scheduler for another executor."""
+    from server.myqueue import wait_in_queue
+    global _inflight_chunks
+
+    state: dict = {}
+    try:
+        await wait_in_queue(element, _make_adapter(sj, start, state))
+    except Exception as e:
+        state['error'] = str(e) or e.__class__.__name__
+    finally:
+        sj.inflight.discard(element)
+        _inflight_chunks -= 1
+        if element.cancelled:
+            sj.cancelled = True
+
+    # Pages up to the first one this chunk did not deliver are safely done — free those
+    # buffers. Anything past it goes back on the retry list for another executor. (The
+    # pipeline emits pages in order, so this prefix is exact; taking the prefix rather than
+    # the count also means an out-of-order emission could only ever cost us a redo, never a
+    # silently dropped page.)
+    done_upto = start
+    while done_upto < end and done_upto in sj.emitted:
+        done_upto += 1
+    for j in range(start, done_upto):
+        sj.images[j] = None
+
+    if not (sj.cancelled or sj.job.status in ('cancelled', 'error')):
+        if done_upto < end:
+            # A chunk that delivered nothing counts as a stall; any progress clears the count.
+            sj.stalls = 0 if done_upto > start else sj.stalls + 1
+            if sj.stalls > MAX_CHUNK_STALLS:
+                _fail(sj, state.get('error') or 'executor made no progress')
+                _sched_event.set()
+                return
+            sj.retry.insert(0, (done_upto, end))
+            logger.warning(
+                f'Gallery job {sj.job.token[:8]}… pages {done_upto}-{end - 1} not delivered '
+                f'({state.get("error") or "chunk ended early"}) — re-queueing for another executor')
+        else:
+            sj.stalls = 0
+            _maybe_finish(sj)
+
+    _sched_event.set()
+
+
 async def _sched_loop() -> None:
-    from server.myqueue import task_queue, wait_in_queue, GalleryQueueElement
+    global _inflight_chunks
     while True:
-        # Retire cancelled/errored jobs before picking (a cancel can land any time).
+        _sched_event.clear()
+
+        # Retire cancelled/errored jobs. One with chunks still unwinding stays until they
+        # return, so its executors are released before the job is forgotten.
         for token in list(_sched_order):
             sj = _sched.get(token)
             if sj is None:
                 _drop(token)
             elif sj.cancelled or sj.job.status in ('cancelled', 'error'):
-                _drop(token)
+                if sj.job.status == 'running':
+                    sj.job.status = 'cancelled'
+                    sj.job.done_at = time.monotonic()
+                if not sj.inflight:
+                    _record(sj, cancelled=(sj.job.status != 'error'))
+                    _drop(token)
 
-        sj = _pick_next()
-        if sj is None:
-            _sched_event.clear()
-            # Wake on new submissions; also tick so waiting-list positions stay fresh.
-            try:
-                await asyncio.wait_for(_sched_event.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                pass
-            continue
+        # Fill the pool: keep dispatching while an executor could still pick work up. Without
+        # this the whole pool is worth one executor, since a second one would never be handed
+        # a chunk until the first had finished its own.
+        while _inflight_chunks < max(1, executor_instances.capacity()):
+            sj = _pick_next()
+            if sj is None:
+                break
+            live = [t for t in _sched_order if t in _sched]
+            claimants = [t for t in live[:ACTIVE_MAX] if _sched[t].has_work]
+            solo = len(claimants) <= 1
+            # When one job has the pool to itself, size its chunks to spread over the whole
+            # pool; when jobs are already competing they spread across executors on their own.
+            split = max(1, executor_instances.capacity()) if solo else 1
+            start, end = sj.take_range(solo, split)
+            end = min(end, sj.total)
+            if end <= start:
+                continue
+            element = _dispatch(sj, start, end)
+            if len(live) > 1 or start > 0 or _inflight_chunks > 1:
+                logger.info(
+                    f'Gallery job {sj.job.token[:8]}… chunk {start}-{end - 1}/{sj.total} '
+                    f'({len(live)} live, {_inflight_chunks} chunk(s) in flight, '
+                    f'{max(0, len(live) - ACTIVE_MAX)} waiting)')
+            asyncio.create_task(_run_chunk(sj, element, start, end))
 
-        live_active = [t for t in _sched_order if t in _sched][:ACTIVE_MAX]
-        start = sj.next_page
-        count = sj.chunk_size(solo=(len(live_active) <= 1))
-        end = start + count
-        sj.next_page = end
-        final = end >= sj.total
-
-        element = GalleryQueueElement(sj.req, sj.images[start:end], sj.config, sj.batch_size, sj.job.token)
-        element.cancelled = sj.cancelled
-        sj.job.task = element          # reaper/cancel reach the in-flight chunk
-        task_queue.add_task(element)
-        if len(live_active) > 1 or start > 0:
-            logger.info(
-                f'Gallery job {sj.job.token[:8]}… chunk {start}-{end - 1}/{sj.total} '
-                f'({len(live_active)} active, {max(0, len([t for t in _sched_order if t in _sched]) - ACTIVE_MAX)} waiting)')
+        # Wake on a submission or a finished chunk; also tick so waiting-list positions and
+        # newly-joined aux capacity are picked up.
+        #
+        # asyncio.wait rather than wait_for: wait_for can report an EXTERNAL cancellation as
+        # TimeoutError, which the `pass` below would swallow — leaving this loop immortal and
+        # hanging server shutdown. asyncio.wait does no such conversion, so a real cancel still
+        # propagates and a timeout just returns.
+        waiter = asyncio.ensure_future(_sched_event.wait())
         try:
-            await wait_in_queue(element, _make_adapter(sj, start, final))
-        except Exception as e:
-            logger.error(f'Gallery job {sj.job.token[:8]}… chunk dispatch failed: {e}')
+            await asyncio.wait({waiter}, timeout=5.0)
         finally:
-            if element.cancelled:
-                sj.cancelled = True
-            sj.job.task = sj           # idle again — cancels land on the scheduler handle
-        # Free consumed pages (the worker held its own copies).
-        for j in range(start, end):
-            sj.images[j] = None
-
-        if sj.cancelled or sj.job.status in ('cancelled', 'error'):
-            if sj.job.status == 'running':
-                sj.job.status = 'cancelled'
-                sj.job.done_at = time.monotonic()
-            _drop(sj.job.token)
-        elif final:
-            _drop(sj.job.token)
+            waiter.cancel()

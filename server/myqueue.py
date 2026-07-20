@@ -71,13 +71,14 @@ class GalleryQueueElement:
     job_token: str
     cancelled: bool
 
-    def __init__(self, req: Request, images: List, config: Config, batch_size: int = 0, job_token: str = ""):
+    def __init__(self, req: Request, images: List, config: Config, batch_size: int = 0, job_token: str = "", parent=None):
         self.req = req
         self.images = images
         self.config = config
         self.batch_size = batch_size
         self.job_token = job_token       # client-issued id; lets /translate/gallery/cancel target this job
         self.cancelled = False           # set by an explicit cancel for a still-queued job
+        self.parent = parent             # the scheduler's _SchedJob, when this chunk belongs to one
 
     async def is_client_disconnected(self) -> bool:
         # A gallery job is server-owned and re-attachable, so its liveness is NOT this one
@@ -85,11 +86,15 @@ class GalleryQueueElement:
         # streams. Only an explicit /cancel_gallery or the liveness reaper (no attached client
         # for the grace window) sets `cancelled`; that, and only that, means "stop the GPU".
         # (Watching self.req here would abort a job the moment its first tab navigated away.)
-        return self.cancelled
+        #
+        # A job's chunks can run on several executors at once, so a cancel lands on the job
+        # rather than on whichever chunk happens to be reachable — each chunk inherits it here.
+        return self.cancelled or bool(self.parent is not None and getattr(self.parent, 'cancelled', False))
 
 
-# token → executor instance currently running that gallery job. Lets the explicit cancel
-# endpoint forward a token-scoped /cancel_gallery to the right worker.
+# token → the executor instances currently running chunks of that gallery job. A job can hold
+# several at once (one chunk per executor), so the explicit cancel endpoint fans its
+# token-scoped /cancel_gallery out to all of them.
 running_galleries: dict = {}
 
 
@@ -131,7 +136,11 @@ async def wait_in_queue(task: QueueElement | BatchQueueElement, notify: NotifyTy
                 raise HTTPException(500, detail="User is no longer connected")  # just for the logs
         if notify:
             notify(3, str(queue_pos).encode('utf-8'))
-        if queue_pos < executor_instances.free_executors():
+        # Aux nodes take gallery chunks only, so a single-image/batch task must measure itself
+        # against local capacity alone or it would queue forever behind executors that will
+        # never be offered to it.
+        gallery = isinstance(task, GalleryQueueElement)
+        if queue_pos < executor_instances.free_executors(gallery):
             if await task.is_client_disconnected():
                 await task_queue.update_event()
                 if notify:
@@ -139,7 +148,7 @@ async def wait_in_queue(task: QueueElement | BatchQueueElement, notify: NotifyTy
                 else:
                     raise HTTPException(500, detail="User is no longer connected") #just for the logs
 
-            instance = await executor_instances.find_executor()
+            instance = await executor_instances.find_executor(gallery)
             await task_queue.remove(task)
             if notify:
                 notify(4, b"")
@@ -151,7 +160,7 @@ async def wait_in_queue(task: QueueElement | BatchQueueElement, notify: NotifyTy
                 # of the gallery while other clients wait.
                 if isinstance(task, GalleryQueueElement):
                     if task.job_token:
-                        running_galleries[task.job_token] = instance
+                        running_galleries.setdefault(task.job_token, set()).add(instance)
                     cancel_sent = False
                     try:
                         stream_task = asyncio.create_task(
@@ -181,7 +190,11 @@ async def wait_in_queue(task: QueueElement | BatchQueueElement, notify: NotifyTy
                         raise
                     finally:
                         if task.job_token:
-                            running_galleries.pop(task.job_token, None)
+                            holders = running_galleries.get(task.job_token)
+                            if holders is not None:
+                                holders.discard(instance)
+                                if not holders:
+                                    running_galleries.pop(task.job_token, None)
                 # Process batch translation task
                 elif isinstance(task, BatchQueueElement):
                     if notify:
