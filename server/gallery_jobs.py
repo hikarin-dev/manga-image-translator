@@ -666,29 +666,34 @@ async def _run_chunk(sj: _SchedJob, element, start: int, end: int) -> None:
         if element.cancelled:
             sj.cancelled = True
 
-    # Pages up to the first one this chunk did not deliver are safely done — free those
-    # buffers. Anything past it goes back on the retry list for another executor. (The
-    # pipeline emits pages in order, so this prefix is exact; taking the prefix rather than
-    # the count also means an out-of-order emission could only ever cost us a redo, never a
-    # silently dropped page.)
+    # A page is ACCOUNTED FOR if it was delivered or if the worker reported it as failed. The
+    # distinction matters: a page the pipeline cannot translate is never emitted as a frame,
+    # it only appears in the chunk summary's `failed` list. Counting solely delivered pages
+    # would read that as "the executor died here", re-translate every good page after it, and
+    # burn the stall budget until the job errored — losing a whole gallery over one bad page.
+    # Failed pages are reported to the client in the job's terminal summary instead.
+    failed = set(sj.failed)
     done_upto = start
-    while done_upto < end and done_upto in sj.emitted:
+    while done_upto < end and (done_upto in sj.emitted or done_upto in failed):
         done_upto += 1
     for j in range(start, done_upto):
         sj.images[j] = None
 
     if not (sj.cancelled or sj.job.status in ('cancelled', 'error')):
         if done_upto < end:
-            # A chunk that delivered nothing counts as a stall; any progress clears the count.
+            # A chunk that accounted for nothing counts as a stall; any progress clears it.
             sj.stalls = 0 if done_upto > start else sj.stalls + 1
             if sj.stalls > MAX_CHUNK_STALLS:
                 _fail(sj, state.get('error') or 'executor made no progress')
                 _sched_event.set()
                 return
             sj.retry.insert(0, (done_upto, end))
+            got = len([i for i in range(start, end) if i in sj.emitted])
+            bad = len([i for i in range(start, end) if i in failed])
             logger.warning(
                 f'Gallery job {sj.job.token[:8]}… pages {done_upto}-{end - 1} not delivered '
-                f'({state.get("error") or "chunk ended early"}) — re-queueing for another executor')
+                f'({state.get("error") or "chunk ended early"}; {got} delivered, {bad} reported '
+                f'failed of {end - start}) — re-queueing for another executor')
         else:
             sj.stalls = 0
             _maybe_finish(sj)

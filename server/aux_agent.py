@@ -196,8 +196,12 @@ class _Relay:
             await frames.put(None)        # drain sentinel: every frame is sent before 'end'
             try:
                 await pump
-            except Exception:
-                pass
+            except Exception as e:
+                # The pages were translated but did not reach the server. Reporting success
+                # here would make the main server see a chunk that "ended early" for no stated
+                # reason, and retry it blind.
+                error = error or f'failed to forward frames: {e}'
+                logger.error(f'chunk {cid}: {error}')
             self.jobs.pop(cid, None)
             self.tasks.pop(cid, None)
         try:
