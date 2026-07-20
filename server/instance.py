@@ -61,11 +61,14 @@ class Executors:
 
     def unregister(self, instance) -> None:
         """Drop an executor that went away (an aux node's socket closed). Any chunk it was
-        running is failed by its own connection teardown; this only stops it being picked."""
-        try:
-            self.list.remove(instance)
-        except ValueError:
-            pass
+        running is failed by its own connection teardown; this only stops it being picked.
+
+        Removes by identity: ExecutorInstance is a pydantic model, so two workers on the same
+        ip:port compare equal and list.remove() could evict the wrong one."""
+        for i, x in enumerate(self.list):
+            if x is instance:
+                self.list.pop(i)
+                return
 
     def _eligible(self, gallery: bool) -> List[ExecutorInstance]:
         return [x for x in self.list if gallery or not getattr(x, 'gallery_only', False)]

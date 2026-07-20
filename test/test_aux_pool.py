@@ -276,6 +276,77 @@ def test_local_executor_defaults_below_aux():
     assert ExecutorInstance(ip='127.0.0.1', port=5004).priority > aux_mod.AUX_PRIORITY
 
 
+class RealModelExecutor(ExecutorInstance):
+    """Subclasses the REAL pydantic model instead of duck-typing it.
+
+    FakeExecutor above is a plain class and therefore hashable; ExecutorInstance is NOT
+    (pydantic v2 sets __hash__ = None on non-frozen models). That difference is exactly what
+    hid a crash on every local-worker chunk, so at least one test has to use the real type."""
+
+    async def sent_gallery_stream(self, images, config, sender, batch_size=0, job_token=""):
+        for i in range(len(images)):
+            sender(5, _page_frame(i, job_token))
+            await asyncio.sleep(0)
+        sender(0, _summary())
+
+    async def cancel_gallery(self, job_token=""):
+        pass
+
+
+def test_pydantic_executor_is_unhashable():
+    """Pins the property that broke things, so a future 'just use a set' change fails loudly
+    here rather than at runtime on every gallery."""
+    with pytest.raises(TypeError):
+        {ExecutorInstance(ip='127.0.0.1', port=5004)}
+
+
+def test_local_worker_completes_a_gallery(pool):
+    """Regression: running_galleries was a set, which cannot hold a pydantic ExecutorInstance.
+    Every chunk dispatched to the local worker died with 'unhashable type: ExecutorInstance',
+    and the retry path then burned the stall budget and failed the whole job."""
+    pool.register(RealModelExecutor(ip='127.0.0.1', port=5004))
+
+    async def scenario():
+        job = _submit(pages=16, batch_size=8)
+        assert await _drain(job) is not None, 'local worker must be able to finish a gallery'
+        return job
+
+    job = asyncio.run(scenario())
+    assert job.status == 'done'
+    assert job.emitted == 16
+
+
+def test_mixed_pool_of_aux_and_local(pool):
+    """The actual deployment: an aux node alongside the pydantic local worker."""
+    from server.myqueue import running_galleries
+    local = RealModelExecutor(ip='127.0.0.1', port=5004)
+    remote = FakeExecutor('aux', priority=10)
+    pool.register(remote)
+    pool.register(local)
+
+    async def scenario():
+        job = _submit(pages=32, batch_size=8)
+        assert await _drain(job) is not None
+        return job
+
+    job = asyncio.run(scenario())
+    assert job.status == 'done' and job.emitted == 32
+    assert remote.chunks, 'the preferred aux node should have taken work'
+    assert running_galleries == {}, 'holders must be cleaned up when chunks finish'
+
+
+def test_unregister_removes_by_identity(pool):
+    """Two workers on the same ip:port are equal by value but are different workers —
+    unregistering one must not evict the other."""
+    a = ExecutorInstance(ip='127.0.0.1', port=5004)
+    b = ExecutorInstance(ip='127.0.0.1', port=5004)
+    assert a == b, 'precondition: pydantic compares these equal'
+    pool.register(a)
+    pool.register(b)
+    pool.unregister(b)
+    assert len(pool.list) == 1 and pool.list[0] is a
+
+
 # ── concurrency ──────────────────────────────────────────────────────────────────────────
 
 def test_one_gallery_is_split_across_the_pool(pool):

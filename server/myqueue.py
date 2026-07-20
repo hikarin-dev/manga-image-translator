@@ -95,6 +95,10 @@ class GalleryQueueElement:
 # token → the executor instances currently running chunks of that gallery job. A job can hold
 # several at once (one chunk per executor), so the explicit cancel endpoint fans its
 # token-scoped /cancel_gallery out to all of them.
+#
+# A list, not a set: ExecutorInstance is a pydantic model, and pydantic v2 sets __hash__ = None
+# on non-frozen models, so a set cannot hold one. Membership here is identity anyway — two
+# workers on the same ip:port are equal by value but are still two different workers.
 running_galleries: dict = {}
 
 
@@ -160,7 +164,7 @@ async def wait_in_queue(task: QueueElement | BatchQueueElement, notify: NotifyTy
                 # of the gallery while other clients wait.
                 if isinstance(task, GalleryQueueElement):
                     if task.job_token:
-                        running_galleries.setdefault(task.job_token, set()).add(instance)
+                        running_galleries.setdefault(task.job_token, []).append(instance)
                     cancel_sent = False
                     try:
                         stream_task = asyncio.create_task(
@@ -192,7 +196,13 @@ async def wait_in_queue(task: QueueElement | BatchQueueElement, notify: NotifyTy
                         if task.job_token:
                             holders = running_galleries.get(task.job_token)
                             if holders is not None:
-                                holders.discard(instance)
+                                # Identity, not equality: two ExecutorInstances with the same
+                                # ip:port compare equal, so a value-based remove could drop a
+                                # different worker that is still running a chunk.
+                                for k, held in enumerate(holders):
+                                    if held is instance:
+                                        holders.pop(k)
+                                        break
                                 if not holders:
                                     running_galleries.pop(task.job_token, None)
                 # Process batch translation task
