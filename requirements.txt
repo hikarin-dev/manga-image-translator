@@ -65,3 +65,11 @@ regex
 --extra-index-url https://frederik-uni.github.io/manga-image-translator-rust/python/wheels/simple/
 rusty-manga-image-translator
 python-bidi
+# Rust render engine for render.renderer "shiori". Not on PyPI, so it is pinned to a release
+# asset. abi3-py39 (any Python 3.9+) but win_amd64 only — the marker makes pip skip the line
+# elsewhere rather than fail the whole install; on other platforms build from the committed
+# source: cd shiori-renderer && maturin build --release -o dist && pip install dist/*.whl
+shiori-renderer @ https://github.com/hikarin-dev/manga-image-translator/releases/download/aux-runtime-v1/shiori_renderer-0.1.0-cp39-abi3-win_amd64.whl ; sys_platform == "win32" and platform_machine == "AMD64"
+# Not a pip package: speech-balloon segmentation weights, from the same release. Without them
+# rendering silently drops to the contour fallback, so a node LOOKS fine while producing pages
+# that differ from every other node. Download manga109_yolo11n_seg.onnx into models/bubble_seg/.
