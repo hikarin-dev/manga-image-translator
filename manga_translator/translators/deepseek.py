@@ -13,6 +13,22 @@ from .common import MissingAPIKeyException
 from .common_gpt import CommonGPTTranslator, normalize_id_tags
 from .keys import DEEPSEEK_API_KEY, DEEPSEEK_API_BASE, DEEPSEEK_MODEL
 from .tokenizers.token_counters import deepseekTokenCounter
+from ..utils.profiling import add_llm_usage
+
+# DeepSeek token pricing (USD per 1M tokens) used only for the COST ESTIMATE in logs.
+# DeepSeek bills input by cache hit vs miss — a repeated system/few-shot prefix is a cheap
+# cache hit — so both are tracked. These are the published deepseek-chat standard-tier rates;
+# update for your model/tier from https://api-docs.deepseek.com/quick_start/pricing .
+_PRICE_IN_CACHE_HIT = 0.07
+_PRICE_IN_CACHE_MISS = 0.27
+_PRICE_OUT = 1.10
+
+
+def estimate_cost_usd(cache_hit: int, cache_miss: int, completion: int) -> float:
+    """Rough USD for one gallery's DeepSeek usage from the token split above."""
+    return (cache_hit * _PRICE_IN_CACHE_HIT
+            + cache_miss * _PRICE_IN_CACHE_MISS
+            + completion * _PRICE_OUT) / 1e6
 
 
 class DeepseekTranslator(CommonGPTTranslator):
@@ -172,8 +188,12 @@ class DeepseekTranslator(CommonGPTTranslator):
                     new_translations = new_translations[:query_size] + [''] * (query_size - len(new_translations))  
                     # Clean translations by keeping only the content before the first newline  
                     new_translations = [t.split('\n')[0].strip() for t in new_translations]  
-                    # Remove any potential prefix markers  
-                    new_translations = [re.sub(r'^\s*<\|\d+\|>\s*', '', t) for t in new_translations]  
+                    # Remove any potential prefix markers
+                    new_translations = [re.sub(r'^\s*<\|\d+\|>\s*', '', t) for t in new_translations]
+                    # A doubled separator in the response ("<|45|>|text") leaves one stray
+                    # leading pipe after marker splitting — strip exactly one, never
+                    # punctuation inside the translation itself.
+                    new_translations = [t[1:].lstrip() if t.startswith('|') else t for t in new_translations]
                     # Check if any translations are empty  
                     if any(not t.strip() for t in new_translations):  
                         self.logger.warning(f'Empty translations detected. Resplitting the batch.') 
@@ -248,11 +268,13 @@ class DeepseekTranslator(CommonGPTTranslator):
         return translations
 
     async def _request_translation(self, to_lang: str, prompt: str) -> str:
-        system_message = self._CHAT_SYSTEM_TEMPLATE.format(to_lang=to_lang) 
-        messages = [  
-            {'role': 'system', 'content': system_message},  
-        ]  
+        # chat_system_template (not the class constant) so config prompt overrides apply here too.
+        system_message = self.chat_system_template.format(to_lang=to_lang)
+        messages = [
+            {'role': 'system', 'content': system_message},
+        ]
         lang_chat_samples = self.get_chat_sample(to_lang)
+        self.logger.debug(f'DeepSeek request: to_lang={to_lang!r} few_shot={"present" if lang_chat_samples else "none"}')
         if lang_chat_samples:
             messages.append({'role': 'user', 'content': lang_chat_samples[0]})
             messages.append({'role': 'assistant', 'content': lang_chat_samples[1]})
@@ -279,16 +301,35 @@ class DeepseekTranslator(CommonGPTTranslator):
             'extra_body': {'thinking': {'type': 'disabled'}},
         }
         try:
+            _req_t0 = time.time()
             response = await self.client.beta.chat.completions.parse(**kwargs)
-            
-            # 添加错误处理和日志
-            if not hasattr(response, 'usage') or not hasattr(response.usage, 'total_tokens'):
+            _req_dt = time.time() - _req_t0
+
+            # 添加错误处理和日志 + per-request instrumentation. `usage` is OpenAI-compatible;
+            # prompt_cache_hit_tokens / prompt_cache_miss_tokens are DeepSeek extensions (read
+            # defensively — absent on other backends). The per-request line makes a slow single
+            # request (the "long silent wait" while nothing renders) visible at a glance.
+            usage = getattr(response, 'usage', None)
+            if usage is None or not hasattr(usage, 'total_tokens'):
                 self.logger.warning("Response does not contain usage information")
                 self.token_count_last = 0
+                add_llm_usage(requests=1, wall=_req_dt)
             else:
-                self.token_count += response.usage.total_tokens
-                self.token_count_last = response.usage.total_tokens
-            
+                prompt_toks = int(getattr(usage, 'prompt_tokens', 0) or 0)
+                completion_toks = int(getattr(usage, 'completion_tokens', 0) or 0)
+                cache_hit = int(getattr(usage, 'prompt_cache_hit_tokens', 0) or 0)
+                cache_miss = int(getattr(usage, 'prompt_cache_miss_tokens', 0) or 0)
+                if not cache_hit and not cache_miss:
+                    cache_miss = prompt_toks   # no cache split reported → treat all input as miss
+                self.token_count += usage.total_tokens
+                self.token_count_last = usage.total_tokens
+                add_llm_usage(requests=1, prompt_tokens=prompt_toks, completion_tokens=completion_toks,
+                              cache_hit=cache_hit, cache_miss=cache_miss, wall=_req_dt)
+                lines = prompt.count('<|')
+                self.logger.info(
+                    f'DeepSeek request: {lines} lines, in={prompt_toks} (cache hit={cache_hit}) '
+                    f'out={completion_toks} tok in {_req_dt:.1f}s')
+
             # 获取响应文本
             # Get the response text
             for choice in response.choices:

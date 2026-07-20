@@ -173,7 +173,6 @@ class ConfigGPT:
         # This key is used to locate nested configuration entries
         self._CONFIG_KEY = config_key
         self.config = None
-        self.langSamples = None # Cache chat/json_samples[to_lang]
         self._json_sample = None
 
     def _config_get(self, key: str, default=None):
@@ -248,38 +247,38 @@ class ConfigGPT:
                                     'en-US' vs 'pt-PT' -> distance=1000 (Undefined)
     
         Returns:
-            list: A list of samples that best match the target language or an 
+            list: A list of samples that best match the target language or an
                     empty list if no sufficient match is found.
         """
-        if self.langSamples is not None:
-            return self.langSamples
-        
-        self.langSamples = []
-
+        # No instance-level caching here on purpose: translator instances are reused
+        # across requests with DIFFERENT target languages, so a cached first match
+        # (e.g. English) used to poison every later run (a CHS request kept getting
+        # the English few-shot sample). Resolution is cheap relative to an API call.
         try:
             if to_lang in self._LANGUAGE_CODE_MAP:
                 to_lang = self._LANGUAGE_CODE_MAP[to_lang]
 
             foundLang = closest_supported_match(
-                                Language.find(to_lang), 
+                                Language.find(to_lang),
                                 [
-                                    Language.find(sampleLang).to_tag() 
+                                    Language.find(sampleLang).to_tag()
                                     for sampleLang in list(all_samples.keys())
                                 ],
-                                max_distance=max_distance 
+                                max_distance=max_distance
                             )
         except:
             self.logger.error(f"Requested chat sample of unknown language: {to_lang}")
-            return self.langSamples
-        
-        # If a match is found: find, cache, and return the chat sample:
+            return []
+
+        # If a match is found: return the corresponding sample:
         if foundLang:
             for sampleLang, samples in all_samples.items():
                 if foundLang == Language.find(sampleLang).to_tag():
-                    self.langSamples = samples
-                    return self.langSamples
+                    self.logger.debug(f'Few-shot sample: requested={to_lang!r} matched={sampleLang!r}')
+                    return samples
 
-        return self.langSamples
+        self.logger.debug(f'Few-shot sample: requested={to_lang!r} matched=none')
+        return []
     
     def get_chat_sample(self, to_lang: str) -> List[str]:
         """

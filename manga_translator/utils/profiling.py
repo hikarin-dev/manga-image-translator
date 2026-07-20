@@ -50,6 +50,39 @@ def snapshot_substages() -> dict[str, float]:
         return dict(_substage)
 
 
+# ── LLM request/token accounting ───────────────────────────────────────────────
+# GPT translators (deepseek, gemini, …) report every API call here: request count,
+# input/output tokens, DeepSeek's cache hit/miss split, and per-request wall time. The
+# gallery pipeline resets this at the start of each chunk and reads it at the end, so the
+# summary can show how many requests were made, the token cost, and — crucially for the
+# "long silent wait" symptom — the wall of the SLOWEST single request. Reset (not
+# snapshot-diff) is safe because the worker runs one gallery chunk at a time.
+_llm_usage: dict[str, float] = {}
+_llm_lock = threading.Lock()
+
+
+def add_llm_usage(requests: int = 0, prompt_tokens: int = 0, completion_tokens: int = 0,
+                  cache_hit: int = 0, cache_miss: int = 0, wall: float = 0.0) -> None:
+    with _llm_lock:
+        _llm_usage['requests'] = _llm_usage.get('requests', 0) + requests
+        _llm_usage['prompt_tokens'] = _llm_usage.get('prompt_tokens', 0) + prompt_tokens
+        _llm_usage['completion_tokens'] = _llm_usage.get('completion_tokens', 0) + completion_tokens
+        _llm_usage['cache_hit'] = _llm_usage.get('cache_hit', 0) + cache_hit
+        _llm_usage['cache_miss'] = _llm_usage.get('cache_miss', 0) + cache_miss
+        _llm_usage['sum_wall'] = _llm_usage.get('sum_wall', 0.0) + wall
+        _llm_usage['max_wall'] = max(_llm_usage.get('max_wall', 0.0), wall)
+
+
+def reset_llm_usage() -> None:
+    with _llm_lock:
+        _llm_usage.clear()
+
+
+def snapshot_llm_usage() -> dict[str, float]:
+    with _llm_lock:
+        return dict(_llm_usage)
+
+
 class Profiler:
     def __init__(self, interval: float = 1.0, enabled: bool = True):
         self.interval = interval

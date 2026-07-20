@@ -274,10 +274,14 @@ class CommonGPTTranslator(ConfigGPT, CommonTranslator):
         # Immediately clean leading and trailing whitespace from each translation text
         new_translations = [t.strip() for t in new_translations]
         
-        if not new_translations[0].strip():  
-            new_translations = new_translations[1:]  
+        if not new_translations[0].strip():
+            new_translations = new_translations[1:]
 
-        if len(queries) == 1 and len(new_translations) == 1 and not re.match(r'^\s*<\|\d+\|>', response):  
+        # A doubled separator ("<|45|>|text") leaves one stray leading pipe after marker
+        # splitting — strip exactly one, never punctuation inside the translation itself.
+        new_translations = [t[1:].strip() if t.startswith('|') else t for t in new_translations]
+
+        if len(queries) == 1 and len(new_translations) == 1 and not re.match(r'^\s*<\|\d+\|>', response):
             raise Warning('Single query response does not contain prefix.')  
         
         return new_translations

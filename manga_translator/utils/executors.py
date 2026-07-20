@@ -93,11 +93,13 @@ async def run_cpu(fn, *args, **kwargs):
 
 
 # ── process pool for GIL-heavy work ────────────────────────────────────────────
-# Mask refinement is ~1s/page of Python-heavy work; on threads it serializes on the
-# GIL with the OCR beam loop and every other Python section, capping the whole
-# pipeline. A small process pool runs the exact same function out-of-process —
-# identical outputs, no GIL contention. Workers are spawned lazily (or via prewarm)
-# and reused for the life of the server.
+# Mask refinement (~1s/page) and study-layer building (per-bubble encodes, ~40% of a dense
+# gallery's wall) are Python-heavy; on threads they serialize on the GIL with the OCR beam loop
+# and every other Python section, capping the whole pipeline (cores sit idle). A process pool
+# runs the exact same functions out-of-process — identical outputs, no GIL contention. Both
+# stages overlap in the pipeline (mask in inpaint_stage, study in the render workers) and now
+# share this pool, so it's sized to the machine rather than a flat 2. Workers hold no torch
+# models (just numpy/PIL), so they're cheap; spawned lazily (or via prewarm) and reused.
 _proc_pool = None
 _proc_lock = threading.Lock()
 
@@ -109,7 +111,8 @@ def _ensure_proc_pool():
     with _proc_lock:
         if _proc_pool is None:
             from concurrent.futures import ProcessPoolExecutor
-            _proc_pool = ProcessPoolExecutor(max_workers=2)
+            workers = max(2, min(4, (os.cpu_count() or 4) // 2))
+            _proc_pool = ProcessPoolExecutor(max_workers=workers)
     return _proc_pool
 
 
