@@ -51,3 +51,34 @@ MANIFEST
 # SSL Used for running server locally
 cert.pem
 key.pem
+
+# Rust renderer build output. shiori-renderer/target is several GB across thousands of
+# files — by far the biggest thing a stray `git add -A` would sweep in. The glob also
+# covers the vendored crate if it is ever built standalone.
+shiori-renderer/**/target/
+*.rs.bk
+
+# Compiled extension modules and wheels (maturin output). Note *.py[cod] already covers
+# the .pyd that maturin produces on Windows; *.so is its Linux/macOS counterpart.
+*.py[cod]
+*.so
+*.whl
+
+# Runtime state the server creates while running. logs/jobs.jsonl records one line per
+# finished job INCLUDING the client IP, so this is privacy-relevant, not just noise.
+logs/
+upload-cache/
+*.log
+*.jsonl
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model weights fetched or converted at runtime (/models is already ignored above; these
+# catch the same files landing next to the code that loads them — e.g. the tflite and
+# safetensors OCR variants)
+*.safetensors
+*.pth
+*.tflite
