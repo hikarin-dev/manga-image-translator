@@ -73,7 +73,7 @@ async def while_streaming(req: Request, transform, config: Config, image: bytes 
     asyncio.create_task(wait_in_queue(task, notify_internal))
     return streaming_response
 
-async def start_gallery_job(req: Request, transform, config: Config, images: list[bytes | str], batch_size: int = 0, job_token: str = ""):
+async def start_gallery_job(req: Request, transform, config: Config, images: list[bytes | str], batch_size: int = 0, job_token: str = "", source_url: str = ""):
     """Polling model: create the server-owned job and hand it to the chunk scheduler, then
     return IMMEDIATELY. The scheduler dispatches the job to the worker one chunk of pages at
     a time (rotating chunks between concurrent jobs — see gallery_jobs), buffering every frame
@@ -86,7 +86,7 @@ async def start_gallery_job(req: Request, transform, config: Config, images: lis
 
     job = gallery_jobs.create(job_token)
     job.total = len(images)               # authoritative page count for the poll progress bar
-    gallery_jobs.submit(job, req, images, config, batch_size, transform)
+    gallery_jobs.submit(job, req, images, config, batch_size, transform, source_url)
     return {"token": job_token, "started": True}
 
 async def get_batch_ctx(req: Request, config: Config, images: list[str|bytes], batch_size: int = 4):

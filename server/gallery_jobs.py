@@ -292,13 +292,19 @@ class _SchedJob:
     """Scheduler-side state for one gallery job. Also serves as the job's cancel handle
     while no chunk is in flight (the reaper/cancel path sets `.cancelled` on job.task)."""
 
-    def __init__(self, job, req, images, config, batch_size, transform):
+    def __init__(self, job, req, images, config, batch_size, transform, source_url=''):
         self.job = job
         self.req = req
         try:
             self.owner_ip = str(getattr(req.state, 'client_ip', '') or '')  # set by server.edge
+            # WHICH access key authenticated this job — the name, never the secret.
+            self.owner_key = str(getattr(req.state, 'key', '') or '')
         except Exception:
             self.owner_ip = ''
+            self.owner_key = ''
+        # Client-supplied label for where this gallery came from. Opaque to the server: stored
+        # and shown to a local operator, never parsed or acted on.
+        self.source_url = str(source_url or '')[:2048]
         self.images = images
         self.config = config
         self.batch_size = int(batch_size) if batch_size else 0
@@ -490,10 +496,10 @@ def _record(sj: _SchedJob, cancelled: bool = False) -> None:
         pass
 
 
-def submit(job: GalleryJob, req, images, config, batch_size, transform) -> None:
+def submit(job: GalleryJob, req, images, config, batch_size, transform, source_url='') -> None:
     """Register a gallery job with the scheduler (replaces enqueueing it whole)."""
     global _sched_started
-    sj = _SchedJob(job, req, images, config, batch_size, transform)
+    sj = _SchedJob(job, req, images, config, batch_size, transform, source_url)
     _sched[job.token] = sj
     _sched_order.append(job.token)
     job.task = sj

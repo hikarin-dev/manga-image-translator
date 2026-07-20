@@ -46,6 +46,47 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ACCESS_TOKEN = (os.getenv('MT_ACCESS_TOKEN') or '').strip()
+
+# ── access keys ────────────────────────────────────────────────────────────────────────
+# MT_ACCESS_TOKEN is the unnamed default key. MT_ACCESS_KEYS issues additional NAMED keys:
+#
+#   MT_ACCESS_KEYS=alice:<secret>,bob:<secret>
+#
+# The name is what gets recorded against a job and shown on the dashboard — never the secret,
+# which is not stored, logged, or returned anywhere. Issuing one key per person is what makes
+# the record useful: with a single shared secret, "which token" has only one possible answer.
+#
+# Names are the seam for per-key policy later (rate limits, permitted translators): resolution
+# already happens once per request, so a limit lookup has somewhere to hang. Nothing is
+# enforced per-key yet — every key currently gets the same global limits.
+def _parse_keys(raw: str) -> dict:
+    keys = {}
+    for entry in (raw or '').split(','):
+        entry = entry.strip()
+        if not entry or ':' not in entry:
+            continue
+        name, _, secret = entry.partition(':')
+        name, secret = name.strip(), secret.strip()
+        if name and secret:
+            keys[secret] = name
+    return keys
+
+
+ACCESS_KEYS = dict(_parse_keys(os.getenv('MT_ACCESS_KEYS', '')))
+if ACCESS_TOKEN:
+    ACCESS_KEYS.setdefault(ACCESS_TOKEN, 'default')
+
+
+def resolve_key(presented: str) -> str | None:
+    """Name of the key this request authenticated with, or None if it matches nothing.
+    Compared in constant time against every key so a wrong guess leaks no timing signal."""
+    matched = None
+    for secret, name in ACCESS_KEYS.items():
+        if hmac.compare_digest(presented, secret):
+            matched = name
+    return matched
+
+
 ALLOWED_ORIGINS = [o.strip().rstrip('/') for o in (
     os.getenv('MT_ALLOWED_ORIGINS')
     or 'https://hikarin-dev.github.io,http://localhost:5500,http://127.0.0.1:5500'
@@ -140,6 +181,8 @@ class EdgeGate:
         state = scope.setdefault('state', {})
         state['external'] = external
         state['client_ip'] = cf_ip or client
+        # Overwritten below once an external caller's key is resolved. Loopback needs no key.
+        state['key'] = '' if external else 'local'
         if external:
             path = scope.get('path') or '/'
             if path == '/':
@@ -165,8 +208,11 @@ class EdgeGate:
                 return await self.app(scope, receive, send)
             if path not in PUBLIC_PATHS:
                 return await self._reject(send, 404, 'Not found')
-            if ACCESS_TOKEN and not hmac.compare_digest(headers.get('x-access-token', ''), ACCESS_TOKEN):
-                return await self._reject(send, 401, 'access token missing or wrong')
+            if ACCESS_KEYS:
+                key = resolve_key(headers.get('x-access-token', ''))
+                if key is None:
+                    return await self._reject(send, 401, 'access token missing or wrong')
+                state['key'] = key
             try:
                 if int(headers.get('content-length') or 0) > MAX_BODY_BYTES:
                     return await self._reject(

@@ -81,10 +81,16 @@ async def dashboard() -> HTMLResponse:
     return HTMLResponse(content=(BASE_DIR / "dashboard.html").read_text(encoding="utf-8"))
 
 @app.get("/dashboard/data", tags=["ui"])
-async def dashboard_data() -> dict:
-    """Everything the dashboard polls, in one request so its numbers are from one instant."""
+async def dashboard_data(req: Request) -> dict:
+    """Everything the dashboard polls, in one request so its numbers are from one instant.
+
+    Two privilege tiers. On loopback the operator sees everything, including who submitted each
+    job and the source they gave. Through the tunnel — an aux node, or an allowlisted address —
+    the per-job identifying fields are dropped server-side before the response is built, so the
+    page can show pool health without disclosing what anyone is reading."""
+    full = not bool(getattr(req.state, "external", False))
     gpu = await asyncio.to_thread(stats.gpu_snapshot)
-    return {**stats.snapshot(gpu), "executors": aux_pool.nodes()}
+    return {**stats.snapshot(gpu, full=full), "executors": aux_pool.nodes()}
 
 def transform_to_image(ctx):
     # 检查是否使用占位符（在web模式下final.png保存后会设置此标记）
@@ -203,7 +209,7 @@ async def stream_image_form_web(req: Request, image: UploadFile = File(...), con
     return await while_streaming(req, transform_to_image, conf, img)
 
 @app.post("/translate/gallery/start", tags=["api", "form", "batch"], response_description="Create a server-owned gallery job and return immediately with its token; collect results via /translate/gallery/poll. A big gallery may arrive as several requests sharing one token (part k of n) — the job starts when the last part lands.")
-async def start_gallery(req: Request, image: list[UploadFile] = File(...), config: str = Form("{}"), batch_size: int = Form(0), job_token: str = Form(""), part: int = Form(0), parts: int = Form(1)) -> dict:
+async def start_gallery(req: Request, image: list[UploadFile] = File(...), config: str = Form("{}"), batch_size: int = Form(0), job_token: str = Form(""), part: int = Form(0), parts: int = Form(1), source_url: str = Form("")) -> dict:
     images = [await f.read() for f in image]
     external = bool(getattr(req.state, "external", False))
     client_ip = str(getattr(req.state, "client_ip", "") or "")
@@ -236,7 +242,7 @@ async def start_gallery(req: Request, image: list[UploadFile] = File(...), confi
     # would sit at 0% until the starvation guard eventually errors it.
     if executor_instances.capacity(gallery=True) == 0:
         raise HTTPException(503, detail="no translation capacity is connected right now — try again shortly")
-    return await start_gallery_job(req, transform_gallery_summary, conf, images, batch_size, job_token)
+    return await start_gallery_job(req, transform_gallery_summary, conf, images, batch_size, job_token, source_url)
 
 @app.post("/translate/gallery/poll", response_class=Response, tags=["api", "batch"], response_description="Short poll. Body = a status-7 metadata frame (JSON {cursor,status,state,done,total}) + the page/study frames produced past `since` + the terminal frame once present. All in the body (not headers) so it survives cross-origin reads.")
 async def poll_gallery(job_token: str = Form(...), since: int = Form(0)) -> Response:
@@ -275,12 +281,16 @@ async def queue_size() -> int:
     return len(task_queue.queue)
 
 @app.get("/stats", tags=["api"])
-async def service_stats() -> dict:
+async def service_stats(req: Request) -> dict:
     """Operator metrics: queue depth, today's jobs/pages, GPU state, recent job summaries.
     Externally reachable (token-gated by the edge middleware); per-job history persists in
-    logs/jobs.jsonl."""
+    logs/jobs.jsonl.
+
+    Only a loopback caller gets the privileged per-job fields. Holding the access token proves
+    you may submit translations — not that you may read who else submitted them, or what they
+    were reading."""
     gpu = await asyncio.to_thread(stats.gpu_snapshot)
-    return stats.snapshot(gpu)
+    return stats.snapshot(gpu, full=not bool(getattr(req.state, "external", False)))
 
 @app.post("/reset-context", tags=["api"])
 async def reset_context():

@@ -34,21 +34,31 @@ def record_job(sj, cancelled: bool = False) -> None:
     """Fold one finished (or cancelled) gallery job into the day counters and jobs.jsonl.
     `sj` is a gallery_jobs._SchedJob — its tel_* fields are already summed across chunks."""
     _roll()
+    wall = round(time.monotonic() - sj.submitted_at, 1)
     entry = {
         'ts': datetime.datetime.now().isoformat(timespec='seconds'),
         'token': (sj.job.token or '')[:8],
         'ip': getattr(sj, 'owner_ip', ''),
+        'key': getattr(sj, 'owner_key', ''),      # access-key NAME, never the secret
+        # Whatever the client said this gallery came from. Free-form and never interpreted
+        # here — the server only stores and displays it.
+        'source_url': getattr(sj, 'source_url', ''),
         'pages': sj.total,
         'emitted': sj.tel_emitted,
         'failed': len(set(sj.failed)),
         'cancelled': bool(cancelled or sj.tel_cancelled),
-        'wall_s': round(time.monotonic() - sj.submitted_at, 1),
+        'wall_s': wall,
+        'sec_per_page': round(wall / sj.total, 2) if sj.total else 0.0,
         'compute_s': round(sj.tel_wall, 1),
         'chunks': sj.chunks_done,
         'stages_s': {k: round(v, 1) for k, v in sj.tel_stages.items()},
+        'waits_s': {k: round(v, 1) for k, v in sj.tel_waits.items()},
         'gpu_max_pct': round(sj.tel_gpu_max),
         'vram_max_mb': round(sj.tel_vram_max),
         'llm_cost_usd': round(sj.tel_llm_cost, 4),
+        'llm_requests': sj.tel_llm_requests,
+        'llm_in': sj.tel_llm_in,
+        'llm_out': sj.tel_llm_out,
     }
     _counters['jobs'] += 1
     if entry['cancelled']:
@@ -89,20 +99,39 @@ def gpu_snapshot() -> dict | None:
     return val
 
 
-def snapshot(gpu: dict | None) -> dict:
+# Per-job fields that identify WHO asked for WHAT. Everything here is stripped for any caller
+# that is not on loopback, so an aux node or an allowlisted remote address sees that a job ran
+# and how long it took, but never who submitted it or what they were reading.
+_PRIVILEGED_JOB_FIELDS = ('ip', 'key', 'token', 'source_url', 'stages_s', 'waits_s',
+                          'llm_cost_usd', 'llm_requests', 'llm_in', 'llm_out')
+
+
+def _redact(entry: dict) -> dict:
+    return {k: v for k, v in entry.items() if k not in _PRIVILEGED_JOB_FIELDS}
+
+
+def snapshot(gpu: dict | None, full: bool = False) -> dict:
     """Assemble the /stats payload. Runs on the event loop (it reads scheduler state);
-    the caller fetches `gpu` off-loop via gpu_snapshot() since nvidia-smi blocks."""
+    the caller fetches `gpu` off-loop via gpu_snapshot() since nvidia-smi blocks.
+
+    `full` is for loopback callers only. Redaction happens HERE rather than in the page, so a
+    reduced caller never receives the sensitive fields at all — hiding them client-side would
+    leave them one devtools tab away."""
     _roll()
     from server import gallery_jobs
     from server.instance import executor_instances
+    today = {'date': _day, **_counters}
+    if not full:
+        today.pop('llm_cost_usd', None)
     return {
+        'full': full,
         'uptime_s': int(time.time() - _BOOT),
         'queue': gallery_jobs.queue_snapshot(),
         'workers': {
             'registered': len(executor_instances.list),
             'busy': len([i for i in executor_instances.list if i.busy]),
         },
-        'today': {'date': _day, **_counters},
+        'today': today,
         'gpu': gpu,
-        'recent_jobs': list(_recent),
+        'recent_jobs': [dict(e) for e in _recent] if full else [_redact(e) for e in _recent],
     }

@@ -710,9 +710,129 @@ def test_translate_endpoints_still_need_the_token(pool, monkeypatch):
     the access token on the translate surface."""
     import server.edge as edge
     monkeypatch.setattr(edge, 'DASHBOARD_NETS', edge._parse_nets('203.0.113.7'))
-    monkeypatch.setattr(edge, 'ACCESS_TOKEN', 'sekrit')
+    monkeypatch.setattr(edge, 'ACCESS_KEYS', {'sekrit': 'default'})
     r = _client('203.0.113.7').post('/translate/gallery/poll', data={'job_token': 'x', 'since': 0})
     assert r.status_code == 401, 'an allowlisted address is still not authenticated'
+
+
+# ── dashboard privilege tiers ────────────────────────────────────────────────────────────
+
+def _record_a_job(source_url='https://example.test/g/42', ip='203.0.113.9'):
+    """Push one finished job through the real recorder, so the tests read the same shape the
+    dashboard does."""
+    import server.stats as stats
+    sj = types.SimpleNamespace(
+        job=types.SimpleNamespace(token='abcdef1234'), owner_ip=ip, source_url=source_url,
+        total=10, tel_emitted=10, failed=[], tel_cancelled=False,
+        submitted_at=__import__('time').monotonic() - 20.0, tel_wall=18.0, chunks_done=1,
+        tel_stages={'ocr': 6.0, 'translate': 9.0}, tel_waits={'gpu': 1.5},
+        tel_gpu_max=97.0, tel_vram_max=7100.0, tel_llm_cost=0.021,
+        tel_llm_requests=3, tel_llm_in=900, tel_llm_out=400)
+    stats.record_job(sj)
+
+
+def test_local_dashboard_sees_the_full_record(pool):
+    _record_a_job()
+    d = _client().get('/dashboard/data').json()
+    assert d['full'] is True
+    j = d['recent_jobs'][-1]
+    assert j['source_url'] == 'https://example.test/g/42'
+    assert j['ip'] == '203.0.113.9' and j['token'] == 'abcdef12'
+    assert j['stages_s'] == {'ocr': 6.0, 'translate': 9.0}
+    assert j['waits_s'] == {'gpu': 1.5}
+    assert j['sec_per_page'] > 0
+    assert 'llm_cost_usd' in d['today']
+
+
+def test_remote_dashboard_never_receives_identity(pool, monkeypatch):
+    """Redaction must happen server-side: a field merely hidden by CSS is one devtools tab
+    away, so the sensitive keys must be absent from the payload entirely."""
+    import server.edge as edge
+    monkeypatch.setattr(edge, 'DASHBOARD_NETS', edge._parse_nets('203.0.113.7'))
+    _record_a_job()
+    d = _client('203.0.113.7').get('/dashboard/data').json()
+
+    assert d['full'] is False
+    body = json.dumps(d)
+    assert 'example.test' not in body, 'the source leaked into a reduced payload'
+    assert '203.0.113.9' not in body, 'a client address leaked into a reduced payload'
+    for j in d['recent_jobs']:
+        for field in ('ip', 'token', 'source_url', 'stages_s', 'waits_s', 'llm_cost_usd'):
+            assert field not in j, f'{field} must be withheld from a remote caller'
+    assert 'llm_cost_usd' not in d['today']
+    # Non-identifying operational figures still come through, so the view stays useful.
+    assert d['recent_jobs'][-1]['pages'] == 10
+    assert d['recent_jobs'][-1]['sec_per_page'] > 0
+    assert d['queue'] and d['executors'] is not None
+
+
+def test_stats_endpoint_redacts_for_token_holders(pool, monkeypatch):
+    """/stats is reachable externally with the access token. Holding it proves you may submit
+    translations, not that you may read who else did."""
+    import server.edge as edge
+    monkeypatch.setattr(edge, 'ACCESS_KEYS', {})       # no keys issued = auth off; still external
+    _record_a_job()
+    d = _client('198.51.100.5').get('/stats').json()
+    assert d['full'] is False
+    assert 'example.test' not in json.dumps(d)
+
+
+def test_named_keys_resolve_to_names_not_secrets(pool, monkeypatch):
+    """Each caller gets its own key so 'which token' has a meaningful answer. Only the NAME is
+    ever recorded — the secret must not appear in any resolved value."""
+    import server.edge as edge
+    monkeypatch.setattr(edge, 'ACCESS_KEYS', {'s3cret-alice': 'alice', 's3cret-bob': 'bob'})
+    assert edge.resolve_key('s3cret-alice') == 'alice'
+    assert edge.resolve_key('s3cret-bob') == 'bob'
+    assert edge.resolve_key('not-a-key') is None
+    assert edge.resolve_key('') is None
+
+
+def test_mt_access_token_still_works_as_the_default_key(pool, monkeypatch):
+    """The single-token setup must keep working unchanged; it is just named 'default' now."""
+    import server.edge as edge
+    monkeypatch.setattr(edge, 'ACCESS_TOKEN', 'legacy')
+    monkeypatch.setattr(edge, 'ACCESS_KEYS', {'legacy': 'default'})
+    assert edge.resolve_key('legacy') == 'default'
+
+
+def test_wrong_key_is_rejected_and_right_key_is_recorded(pool, monkeypatch):
+    import server.edge as edge
+    monkeypatch.setattr(edge, 'ACCESS_KEYS', {'k-alice': 'alice'})
+    bad = _client('203.0.113.7')
+    assert bad.post('/translate/gallery/poll', data={'job_token': 'x', 'since': 0}).status_code == 401
+    good = _client('203.0.113.7')
+    good.headers.update({'x-access-token': 'k-alice'})
+    # Reaches the handler (the job does not exist, but auth passed) rather than 401.
+    assert good.post('/translate/gallery/poll', data={'job_token': 'x', 'since': 0}).status_code == 200
+
+
+def test_key_name_is_withheld_from_remote_dashboards(pool, monkeypatch):
+    """Which key ran a job is operator information, like the address and the source."""
+    import server.edge as edge
+    monkeypatch.setattr(edge, 'DASHBOARD_NETS', edge._parse_nets('203.0.113.7'))
+    import server.stats as stats
+    sj = types.SimpleNamespace(
+        job=types.SimpleNamespace(token='t'), owner_ip='1.2.3.4', owner_key='alice',
+        source_url='', total=1, tel_emitted=1, failed=[], tel_cancelled=False,
+        submitted_at=__import__('time').monotonic(), tel_wall=1.0, chunks_done=1,
+        tel_stages={}, tel_waits={}, tel_gpu_max=0, tel_vram_max=0, tel_llm_cost=0,
+        tel_llm_requests=0, tel_llm_in=0, tel_llm_out=0)
+    stats.record_job(sj)
+    assert _client().get('/dashboard/data').json()['recent_jobs'][-1]['key'] == 'alice'
+    assert 'alice' not in json.dumps(_client('203.0.113.7').get('/dashboard/data').json())
+
+
+def test_source_url_is_accepted_and_bounded(pool):
+    """The field is opaque to the server — stored and shown, never parsed. Bounded so a client
+    cannot push an arbitrarily large string into every line of the job log."""
+    req = types.SimpleNamespace(state=types.SimpleNamespace(client_ip=''))
+    config = types.SimpleNamespace(translator=types.SimpleNamespace(translator='none'))
+    mk = lambda url: gj._SchedJob(gj.GalleryJob('tok-src'), req, [b'x'], config, 1,
+                                  lambda s: b'', url)
+    assert mk('https://example.test/g/42').source_url == 'https://example.test/g/42'
+    assert len(mk('https://example.test/' + 'a' * 5000).source_url) == 2048
+    assert mk(None).source_url == '', 'a client that sends nothing is fine'
 
 
 # ── AuxInstance frame routing ────────────────────────────────────────────────────────────

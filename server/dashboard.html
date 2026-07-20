@@ -126,6 +126,38 @@
   .axis { display: flex; justify-content: space-between; color: var(--text-muted); font-size: 12px; margin-top: 6px; }
 
   .err { color: var(--critical); font-size: 13px; }
+
+  /* Job detail modal (local operator only) */
+  tbody tr.clickable { cursor: pointer; }
+  tbody tr.clickable:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  dialog#detail {
+    border: 1px solid var(--border); border-radius: 12px; padding: 0;
+    background: var(--surface-1); color: var(--text-primary);
+    max-width: min(680px, 92vw); width: 100%;
+  }
+  dialog#detail::backdrop { background: rgba(0,0,0,.45); }
+  .dhead { display: flex; align-items: baseline; gap: 10px; padding: 16px 18px; border-bottom: 1px solid var(--gridline); }
+  .dhead h3 { margin: 0; font-size: 15px; font-weight: 600; }
+  .dbody { padding: 16px 18px; }
+  .dbody section { margin-bottom: 18px; }
+  .dbody section:last-child { margin-bottom: 0; }
+  .dbody h4 {
+    font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
+    color: var(--text-muted); margin: 0 0 8px;
+  }
+  .kv { display: grid; grid-template-columns: 150px 1fr; gap: 6px 14px; font-size: 13px; }
+  .kv dt { color: var(--text-secondary); }
+  .kv dd { margin: 0; word-break: break-all; }
+  /* Stage breakdown: one series against a known total, so a single-hue bar per row. */
+  .stage { display: grid; grid-template-columns: 130px 1fr 62px; gap: 10px; align-items: center; margin-bottom: 6px; font-size: 13px; }
+  .stage .track { height: 6px; background: var(--muted-fill); border-radius: 3px; overflow: hidden; }
+  .stage .track > span { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+  .stage .val { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+  .dfoot { padding: 12px 18px; border-top: 1px solid var(--gridline); text-align: right; }
+  .btn {
+    font: inherit; padding: 6px 14px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--plane); color: var(--text-primary);
+  }
 </style>
 </head>
 <body>
@@ -160,18 +192,21 @@
     <h2>Recent jobs</h2>
     <div id="strip"></div>
     <div class="scroll" style="margin-top:16px"><table>
-      <thead><tr>
-        <th>Time</th><th>Job</th><th class="num">Pages</th><th class="num">Done</th>
-        <th class="num">Failed</th><th class="num">Wall</th><th class="num">Compute</th>
-        <th class="num">Cost</th><th>Result</th>
-      </tr></thead>
+      <thead><tr id="jobshead"></tr></thead>
       <tbody id="jobs"></tbody>
     </table></div>
     <div class="empty" id="jobsempty" hidden>No jobs recorded since the server started.</div>
+    <p class="sub" id="jobshint" style="margin:10px 2px 0" hidden>Select a job for its full record.</p>
   </div>
 
   <p class="sub" id="err"></p>
 </div>
+
+<dialog id="detail">
+  <div class="dhead"><h3 id="dtitle">Job</h3><span class="sub" id="dsub"></span></div>
+  <div class="dbody" id="dbody"></div>
+  <div class="dfoot"><button class="btn" id="dclose">Close</button></div>
+</dialog>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -198,7 +233,9 @@ function renderKpis(d) {
     kpi('Live jobs', q.live_jobs ?? 0, '', `${q.active ?? 0} active · ${q.waiting ?? 0} waiting`),
     kpi('Executors', `${w.busy ?? 0}/${w.registered ?? 0}`, '', ready ? `${ready} in normal rotation` : 'fallback only'),
     kpi('Pages today', t.pages ?? 0, '', `${t.jobs ?? 0} jobs · ${t.pages_failed ?? 0} failed`),
-    kpi('LLM cost today', '$' + (t.llm_cost_usd ?? 0).toFixed(4), '', dur(t.compute_s ?? 0) + ' compute'),
+    t.llm_cost_usd === undefined
+      ? kpi('Compute today', dur(t.compute_s ?? 0), '', `${t.jobs ?? 0} jobs`)
+      : kpi('LLM cost today', '$' + t.llm_cost_usd.toFixed(4), '', dur(t.compute_s ?? 0) + ' compute'),
   ].join('');
 }
 
@@ -241,9 +278,15 @@ function renderGpu(g) {
     meter('VRAM', vramPct, `${(g.vram_used_mb / 1024).toFixed(1)} / ${(g.vram_total_mb / 1024).toFixed(1)} GB`);
 }
 
-function renderJobs(list) {
+// Newest-first table rows, keyed so a click can find the record again.
+let JOBS = [];
+let FULL = false;
+
+function renderJobs(list, full) {
   const jobs = (list || []).slice().reverse();   // newest first in the table
+  JOBS = jobs; FULL = full;
   $('jobsempty').hidden = jobs.length > 0;
+  $('jobshint').hidden = !(full && jobs.length);
 
   // Bar strip: pages per job, oldest → newest. One series, so no legend; hover gives detail.
   const strip = (list || []);
@@ -254,23 +297,99 @@ function renderJobs(list) {
     return `<div class="bar${j.cancelled ? ' cancelled' : ''}" style="height:${h}px" data-tip="${esc(tip)}"></div>`;
   }).join('') + `</div><div class="axis"><span>oldest</span><span>pages per job · newest</span></div>` : '';
 
-  $('jobs').innerHTML = jobs.map(j => {
-    const ok = !j.cancelled && !j.failed;
+  // Columns differ by privilege: the withheld ones are absent from the payload entirely, so
+  // the header is built to match rather than rendering empty cells.
+  const cols = ['Time']
+    .concat(full ? ['Job', 'Source'] : [])
+    .concat(['Pages', 'Done', 'Failed', 'Wall', 's/page', 'Compute'])
+    .concat(full ? ['Cost'] : [])
+    .concat(['Result']);
+  const numeric = new Set(['Pages', 'Done', 'Failed', 'Wall', 's/page', 'Compute', 'Cost']);
+  $('jobshead').innerHTML = cols
+    .map(c => `<th class="${numeric.has(c) ? 'num' : ''}">${esc(c)}</th>`).join('');
+
+  $('jobs').innerHTML = jobs.map((j, i) => {
     const cls = j.cancelled ? 'idle' : (j.failed ? 'warn' : 'good');
     const word = j.cancelled ? 'Cancelled' : (j.failed ? 'Partial' : 'Complete');
-    return `<tr>
+    const spp = j.sec_per_page ?? (j.pages ? j.wall_s / j.pages : 0);
+    const src = j.source_url
+      ? `<a href="${esc(j.source_url)}" target="_blank" rel="noopener noreferrer">${esc(host(j.source_url))}</a>`
+      : '<span class="sub">—</span>';
+    return `<tr class="${full ? 'clickable' : ''}" data-i="${i}">
       <td class="mono">${esc((j.ts || '').replace('T', ' ').slice(5))}</td>
-      <td class="mono">${esc(j.token || '')}</td>
+      ${full ? `<td class="mono">${esc(j.token || '')}</td><td>${src}</td>` : ''}
       <td class="num">${j.pages ?? 0}</td>
       <td class="num">${j.emitted ?? 0}</td>
       <td class="num">${j.failed ?? 0}</td>
       <td class="num">${dur(j.wall_s)}</td>
+      <td class="num">${spp ? spp.toFixed(2) + 's' : '—'}</td>
       <td class="num">${dur(j.compute_s)}</td>
-      <td class="num">${j.llm_cost_usd ? '$' + j.llm_cost_usd.toFixed(4) : '—'}</td>
+      ${full ? `<td class="num">${j.llm_cost_usd ? '$' + j.llm_cost_usd.toFixed(4) : '—'}</td>` : ''}
       <td><span class="state"><span class="dot ${cls}"></span>${word}</span></td>
     </tr>`;
   }).join('');
 }
+
+function host(u) {
+  try { return new URL(u).host || u; } catch { return u; }
+}
+
+// ── job detail (loopback only) ───────────────────────────────────────────────────────────
+function openDetail(j) {
+  const rows = (obj, unit = 's') => {
+    const entries = Object.entries(obj || {}).sort((a, b) => b[1] - a[1]);
+    const max = Math.max(1e-9, ...entries.map(e => e[1]));
+    return entries.length ? entries.map(([k, v]) => `<div class="stage">
+        <span>${esc(k)}</span>
+        <span class="track"><span style="width:${Math.max(1, (v / max) * 100).toFixed(1)}%"></span></span>
+        <span class="val">${v.toFixed(1)}${unit}</span>
+      </div>`).join('') : '<div class="sub">none recorded</div>';
+  };
+  const kv = pairs => `<dl class="kv">` + pairs
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join('') + `</dl>`;
+
+  const spp = j.sec_per_page ?? (j.pages ? j.wall_s / j.pages : 0);
+  $('dtitle').textContent = `Job ${j.token || ''}`;
+  $('dsub').textContent = (j.ts || '').replace('T', ' ');
+  $('dbody').innerHTML = `
+    <section><h4>Request</h4>${kv([
+      ['Client address', `<span class="mono">${esc(j.ip || 'local')}</span>`],
+      ['Access key', j.key
+        ? `<span class="mono">${esc(j.key)}</span>`
+        : '<span class="sub">none (unauthenticated)</span>'],
+      ['Job token', `<span class="mono">${esc(j.token || '')}</span>`],
+      ['Source', j.source_url
+        ? `<a href="${esc(j.source_url)}" target="_blank" rel="noopener noreferrer">${esc(j.source_url)}</a>`
+        : '<span class="sub">not supplied</span>'],
+      ['Outcome', j.cancelled ? 'Cancelled' : (j.failed ? `Partial — ${j.failed} page(s) failed` : 'Complete')],
+    ])}</section>
+    <section><h4>Throughput</h4>${kv([
+      ['Pages', `${j.emitted ?? 0} of ${j.pages ?? 0} delivered`],
+      ['Wall time', dur(j.wall_s)],
+      ['Seconds per page', spp ? spp.toFixed(2) + 's' : '—'],
+      ['On-GPU compute', dur(j.compute_s)],
+      ['Chunks', j.chunks ?? '—'],
+      ['Peak GPU', j.gpu_max_pct ? j.gpu_max_pct + '%' : '—'],
+      ['Peak VRAM', j.vram_max_mb ? (j.vram_max_mb / 1024).toFixed(1) + ' GB' : '—'],
+    ])}</section>
+    <section><h4>Pipeline stages</h4>${rows(j.stages_s)}</section>
+    <section><h4>Queue waits</h4>${rows(j.waits_s)}</section>
+    ${j.llm_requests ? `<section><h4>LLM</h4>${kv([
+      ['Requests', j.llm_requests],
+      ['Tokens in / out', `${j.llm_in ?? 0} / ${j.llm_out ?? 0}`],
+      ['Estimated cost', '$' + (j.llm_cost_usd ?? 0).toFixed(4)],
+    ])}</section>` : ''}`;
+  $('detail').showModal();
+}
+
+$('jobs').addEventListener('click', e => {
+  const tr = e.target.closest('tr[data-i]');
+  if (!tr || !FULL || e.target.closest('a')) return;   // let a source link open normally
+  const j = JOBS[Number(tr.dataset.i)];
+  if (j) openDetail(j);
+});
+$('dclose').addEventListener('click', () => $('detail').close());
 
 let fails = 0;
 async function tick() {
@@ -281,7 +400,7 @@ async function tick() {
     renderKpis(d);
     renderPool(d.executors);
     renderGpu(d.gpu);
-    renderJobs(d.recent_jobs);
+    renderJobs(d.recent_jobs, !!d.full);
     $('uptime').textContent = 'up ' + dur(d.uptime_s);
     $('livedot').className = 'dot good';
     $('live').textContent = 'live · updated ' + new Date().toLocaleTimeString();
