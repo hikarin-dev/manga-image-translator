@@ -47,6 +47,11 @@ def parse_arguments():
     parser.add_argument('--context-size', default=0, type=int, help='Pages of previous translations to feed LLM translators as context')
     parser.add_argument('--pre-dict', default=None, type=file_path, help='Path to the pre-translation dictionary file')
     parser.add_argument('--post-dict', default=None, type=file_path, help='Path to the post-translation dictionary file')    
+    parser.add_argument('--lazy', action='store_true',
+                        default=(os.getenv('MT_LAZY') or '').strip().lower() in ('1', 'true', 'yes'),
+                        help='Hold this machine\'s GPU in reserve: while any aux node is connected '
+                             'every gallery goes to the nodes, even if they are all busy. Falls back '
+                             'to the local worker only when no node is connected at all')
     parser.add_argument('--aux', action='store_true',
                         help='Run as an auxiliary worker node instead of a server: start a local '
                              'worker and join the main server given by --join to take its gallery work')

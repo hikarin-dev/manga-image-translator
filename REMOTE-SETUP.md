@@ -110,6 +110,33 @@ Then translate a small gallery from the app with the tunnel URL + token set.
   timings, GPU/VRAM peaks, LLM cost, client IP). Survives restarts.
 - `logs\server-restarts.log` — every (re)start from run-remote-server.bat.
 
+## Operator dashboard
+
+Pool state, queue depth, GPU meters, today's totals and recent jobs, at `/dashboard`.
+
+- **Locally: always on**, no configuration — `http://127.0.0.1:5003/dashboard`. (5003 is the
+  server; 5004 is its internal worker and has no dashboard.)
+- **Through the tunnel: address-gated**, at `https://translate.YOURDOMAIN.com/dashboard`.
+  A browser navigation cannot send `X-Access-Token`, so the caller's address is the
+  credential instead. Allowed callers are:
+  - anything in `MT_DASHBOARD_IPS` — comma-separated, exact addresses or CIDR, e.g.
+    `MT_DASHBOARD_IPS=203.0.113.7,198.51.100.0/24`
+  - **automatically, every aux node currently connected**, so whoever is lending a GPU can
+    watch the pool without being added to a list. Access lapses when their node disconnects.
+
+  Anyone else gets a 404 — not a 403 — so the page's existence isn't advertised.
+
+This allowlist is only trustworthy because the tunnel is the sole way in: with no forwarded
+port, every external request arrives via cloudflared and `cf-connecting-ip` is stamped by
+Cloudflare rather than by the caller. If you ever expose the origin directly, that stops being
+true and the dashboard needs real authentication.
+
+Two things to keep in mind. The address is the *only* check, so everyone behind the same public
+address — the rest of the household, others in the same CGNAT pool — can also read it, and it
+shows the aux roster plus a job history containing client IPs. And home addresses are dynamic:
+if yours changes you are locked out until you update `MT_DASHBOARD_IPS`, which is why browsing
+from the server machine itself should just use `127.0.0.1`.
+
 ## Adding GPU capacity: auxiliary nodes
 
 Any spare machine can lend its GPU to this server. The node **dials out** to the server and
@@ -145,6 +172,11 @@ the `--verbose` intermediate images. Full worker output lands in `logs\aux-worke
 
 - Aux nodes are **preferred over the main server's own GPU** (`MT_AUX_PRIORITY`, default 10
   vs. local 100), so remote capacity is spent first and this machine stays responsive.
+- `--lazy` (or `MT_LAZY=1`) goes further: while *any* node is connected, galleries go to the
+  nodes even when they are all busy, and the local GPU is used only when no node is connected
+  at all. The local worker still starts — it is that fallback — but with `--models-ttl` it
+  unloads from VRAM while idle, so the card is genuinely free. Single-image requests still run
+  locally either way, since nodes are gallery-only.
 - A gallery is split across every free node rather than pinned to one, so two nodes really do
   halve a single gallery instead of only helping when two galleries are queued.
 - If a node drops mid-chunk, only the pages it never delivered are re-queued elsewhere; the

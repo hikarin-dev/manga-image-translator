@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from typing import List, Optional
 
 from PIL import Image
@@ -124,13 +125,31 @@ class TaskQueue:
         self.queue.remove(task)
         await self.update_event()
 
-    async def wait_for_event(self):
-        await self.queue_event.wait()
+    async def wait_for_event(self, timeout: float | None = None):
+        if timeout is None:
+            await self.queue_event.wait()
+            return
+        # asyncio.wait rather than wait_for: wait_for can surface an external cancellation as
+        # TimeoutError, and callers treat a timeout as "re-check and keep waiting" — which
+        # would make a cancelled task immortal.
+        waiter = asyncio.ensure_future(self.queue_event.wait())
+        try:
+            await asyncio.wait({waiter}, timeout=timeout)
+        finally:
+            waiter.cancel()
 
 task_queue = TaskQueue()
 
+# With a local worker there is always at least one executor, so a queued task could safely wait
+# forever. A --delegate-only server has no local worker, so if every aux node disconnects the
+# pool is empty indefinitely and a task would hang while the client polls a job that never
+# moves. Fail the task once the pool has been empty this long instead; for a gallery chunk the
+# scheduler turns that into a retry and, if capacity never returns, a clean job error.
+NO_EXECUTOR_TIMEOUT_S = float(os.getenv('MT_NO_EXECUTOR_TIMEOUT_S', '180'))
+
 async def wait_in_queue(task: QueueElement | BatchQueueElement, notify: NotifyType):
     """Will get task position report it. If its in the range of translators then it will try to aquire an instance(blockig) and sent a task to it. when done the item will be removed from the queue and result will be returned"""
+    starved_since: Optional[float] = None
     while True:
         queue_pos = task_queue.get_pos(task)
         if queue_pos is None:
@@ -241,4 +260,30 @@ async def wait_in_queue(task: QueueElement | BatchQueueElement, notify: NotifyTy
                 else:
                     raise HTTPException(500, detail=error_msg)
         else:
-            await task_queue.wait_for_event()
+            # Starvation guard: an EMPTY pool (not merely a busy one) can never serve this task,
+            # so waiting on it is waiting for a node to connect. Give that a bounded window —
+            # long enough to ride out an aux node restarting — then fail rather than hang.
+            if executor_instances.capacity(gallery) == 0:
+                if starved_since is None:
+                    starved_since = time.monotonic()
+                elif time.monotonic() - starved_since > NO_EXECUTOR_TIMEOUT_S:
+                    try:
+                        await task_queue.remove(task)
+                    except ValueError:
+                        pass
+                    detail = ('no translation capacity: no worker is connected to this server'
+                              if gallery else
+                              'no local translator worker is running (this task cannot run on an aux node)')
+                    if notify:
+                        notify(2, detail.encode('utf-8'))
+                        return
+                    raise HTTPException(503, detail=detail)
+            else:
+                starved_since = None
+            # Normally just a slow re-check. While starved, shorten the slice to whatever is
+            # left of the window so the guard fires at its deadline instead of at the next
+            # 5-second tick.
+            wait = 5.0
+            if starved_since is not None:
+                wait = min(wait, max(0.05, NO_EXECUTOR_TIMEOUT_S - (time.monotonic() - starved_since)))
+            await task_queue.wait_for_event(timeout=wait)

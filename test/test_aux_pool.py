@@ -451,6 +451,270 @@ def test_all_pages_delivered_once_under_failure(pool):
     assert sorted(seen) == list(range(24)), f'pages delivered: {sorted(seen)}'
 
 
+# ── pages the worker cannot translate ────────────────────────────────────────────────────
+
+class FailsPageExecutor(FakeExecutor):
+    """Mimics the real worker's contract for a page it cannot translate: no page frame is
+    emitted for it, and its index is reported in the chunk summary's `failed` list."""
+
+    def __init__(self, name, priority=100, bad=()):
+        super().__init__(name, priority)
+        self.bad = set(bad)          # job-absolute indices this executor cannot translate
+        self.next_start = 0
+
+    async def sent_gallery_stream(self, images, config, sender, batch_size=0, job_token=""):
+        self.chunks.append(len(images))
+        start = self.next_start
+        self.next_start += len(images)
+        local_failed = []
+        for i in range(len(images)):
+            if (start + i) in self.bad:
+                local_failed.append(i)
+                continue
+            sender(5, _page_frame(i, job_token))
+            await asyncio.sleep(0)
+        sender(0, _summary(failed=local_failed))
+
+
+def test_a_failed_page_does_not_retry_the_whole_chunk(pool):
+    """The regression behind 'pages 0-9 not delivered (chunk ended early)'.
+
+    A page the pipeline cannot translate is never emitted as a frame — it only appears in the
+    summary's failed list. Treating that as an undelivered page made the scheduler re-translate
+    every good page after it and burn the stall budget until the job errored, so one bad page
+    cost the whole gallery."""
+    ex = FailsPageExecutor('worker', priority=10, bad={0})
+    pool.register(ex)
+
+    async def scenario():
+        job = _submit(pages=16, batch_size=8)
+        assert await _drain(job, timeout=8.0) is not None
+        return job
+
+    job = asyncio.run(scenario())
+    assert job.status == 'done', 'one unusable page must not fail the whole gallery'
+    assert job.terminal[0] == 0, 'client should get the normal summary, not an error frame'
+    assert sum(ex.chunks) == 16, f'no page should be translated twice, dispatched {ex.chunks}'
+    body = json.loads(job.terminal[5:])
+    assert body['failed'] == [0], f'the bad page must be reported to the client, got {body}'
+    assert job.emitted == 15, 'the other 15 pages are delivered exactly once'
+
+
+def test_a_failed_page_mid_chunk_still_completes(pool):
+    """Same, with the bad page in the middle — the pages after it must not be redone."""
+    ex = FailsPageExecutor('worker', priority=10, bad={5})
+    pool.register(ex)
+
+    async def scenario():
+        job = _submit(pages=12, batch_size=8)
+        assert await _drain(job, timeout=8.0) is not None
+        return job
+
+    job = asyncio.run(scenario())
+    assert job.status == 'done'
+    assert sum(ex.chunks) == 12, f'pages after the failure were re-translated: {ex.chunks}'
+    assert json.loads(job.terminal[5:])['failed'] == [5]
+
+
+# ── lazy mode ────────────────────────────────────────────────────────────────────────────
+
+def test_lazy_flag_parses():
+    import sys
+    from server.args import parse_arguments
+    saved = sys.argv
+    try:
+        sys.argv = ['main.py', '--lazy']
+        assert parse_arguments().lazy is True
+        sys.argv = ['main.py']
+        assert parse_arguments().lazy is False
+    finally:
+        sys.argv = saved
+
+
+def test_lazy_local_sits_out_while_any_aux_is_connected(pool):
+    """The distinction from plain priority: a reserve executor is skipped even when the aux
+    node is BUSY. Priority alone would hand it the next chunk the moment the node was taken."""
+    local = FakeExecutor('local', priority=100)
+    local.reserve = True
+    remote = FakeExecutor('aux', priority=10)
+    pool.register(local)
+    pool.register(remote)
+
+    assert pool.capacity(gallery=True) == 1, 'only the aux node counts as capacity'
+    remote.busy = True
+    assert pool.free_executors(gallery=True) == 0, 'must wait for the busy node, not use local'
+
+
+def test_lazy_local_takes_over_when_the_last_aux_leaves(pool):
+    """The fallback: with no node connected the reserve executor is all there is, so it works."""
+    local = FakeExecutor('local', priority=100)
+    local.reserve = True
+    remote = FakeExecutor('aux', priority=10)
+    pool.register(local)
+    pool.register(remote)
+    pool.unregister(remote)                      # node disconnects
+
+    assert pool.capacity(gallery=True) == 1
+    assert asyncio.run(pool.find_executor(gallery=True)) is local
+
+
+def test_lazy_local_still_serves_single_image_work(pool):
+    """Aux nodes are gallery-only, so eligibility is judged per task kind: the reserve worker
+    must still be picked for single-image work even while a node is connected."""
+    local = FakeExecutor('local', priority=100)
+    local.reserve = True
+    remote = FakeExecutor('aux', priority=10)
+    remote.gallery_only = True
+    pool.register(local)
+    pool.register(remote)
+
+    assert asyncio.run(pool.find_executor(gallery=False)) is local
+
+
+def test_lazy_gallery_runs_end_to_end_on_the_aux_node(pool):
+    """Whole path under lazy: the local worker must translate nothing."""
+    local = FakeExecutor('local', priority=100)
+    local.reserve = True
+    remote = FakeExecutor('aux', priority=10)
+    pool.register(local)
+    pool.register(remote)
+
+    async def scenario():
+        job = _submit(pages=24, batch_size=8)
+        assert await _drain(job) is not None
+        return job
+
+    job = asyncio.run(scenario())
+    assert job.status == 'done' and job.emitted == 24
+    assert local.chunks == [], f'reserve worker should have stayed idle, got {local.chunks}'
+    assert sum(remote.chunks) == 24
+
+
+def test_empty_pool_fails_a_task_instead_of_hanging(pool, monkeypatch):
+    """Backstop for the case --lazy's fallback cannot cover: the local worker died AND no aux
+    node is connected. The task must error rather than leave the client polling a job that can
+    never move."""
+    import server.myqueue as mq
+    monkeypatch.setattr(mq, 'NO_EXECUTOR_TIMEOUT_S', 0.2)
+    assert pool.capacity(gallery=True) == 0, 'precondition: nothing registered'
+
+    async def scenario():
+        job = _submit(pages=8, batch_size=8)
+        return await _drain(job, timeout=6.0)
+
+    terminal = asyncio.run(scenario())
+    assert terminal is not None, 'job must terminate rather than hang'
+    assert terminal[0] == 2, 'client must be told there is no capacity'
+    assert b'no translation capacity' in terminal
+
+
+def test_capacity_returning_in_time_is_not_a_failure(pool, monkeypatch):
+    """An aux node restarting must not kill in-flight work — the guard only fires when the pool
+    stays empty past the window."""
+    import server.myqueue as mq
+    monkeypatch.setattr(mq, 'NO_EXECUTOR_TIMEOUT_S', 3.0)
+
+    async def scenario():
+        job = _submit(pages=8, batch_size=8)
+        await asyncio.sleep(0.3)               # job queued against an empty pool
+        pool.register(FakeExecutor('late', priority=10))   # node connects
+        await mq.task_queue.update_event()
+        assert await _drain(job, timeout=6.0) is not None
+        return job
+
+    job = asyncio.run(scenario())
+    assert job.status == 'done' and job.emitted == 8
+
+
+# ── dashboard access ─────────────────────────────────────────────────────────────────────
+
+def _client(ip=None):
+    """A TestClient whose requests look local (no ip) or like tunnel traffic from `ip`."""
+    from fastapi.testclient import TestClient
+    from server.main import app
+    if ip is None:
+        return TestClient(app, client=('127.0.0.1', 5555))
+    c = TestClient(app, client=('127.0.0.1', 5555))
+    c.headers.update({'cf-connecting-ip': ip})   # what cloudflared stamps on real traffic
+    return c
+
+
+def test_dashboard_always_available_locally(pool):
+    c = _client()
+    assert c.get('/dashboard').status_code == 200
+    assert c.get('/dashboard/data').status_code == 200
+
+
+def test_dashboard_hidden_from_unknown_addresses(pool, monkeypatch):
+    """A 404 rather than a 403: an unlisted caller should not learn the page exists."""
+    import server.edge as edge
+    monkeypatch.setattr(edge, 'DASHBOARD_NETS', edge._parse_nets('203.0.113.7'))
+    c = _client('198.51.100.42')
+    assert c.get('/dashboard').status_code == 404
+    assert c.get('/dashboard/data').status_code == 404
+
+
+def test_dashboard_reachable_from_an_allowlisted_address(pool, monkeypatch):
+    import server.edge as edge
+    monkeypatch.setattr(edge, 'DASHBOARD_NETS', edge._parse_nets('203.0.113.7, 198.51.100.0/24'))
+    assert _client('203.0.113.7').get('/dashboard').status_code == 200      # exact
+    assert _client('198.51.100.42').get('/dashboard').status_code == 200    # inside the CIDR
+    assert _client('192.0.2.1').get('/dashboard').status_code == 404        # outside both
+
+
+def test_connected_aux_node_gets_dashboard_access(pool, monkeypatch):
+    """The point of the feature: whoever is lending a GPU can watch the pool without being
+    added to a list by hand — and loses access when their node goes away."""
+    import server.edge as edge
+    monkeypatch.setattr(edge, 'DASHBOARD_NETS', [])
+    monkeypatch.setattr(aux_mod, 'JOIN_TOKEN', 'sekrit')
+    monkeypatch.setattr(aux_mod, 'code_version', lambda: 'v1')
+
+    assert _client('203.0.113.55').get('/dashboard').status_code == 404, 'no node yet'
+
+    node = aux_mod.AuxInstance(_FakeWS([]), 'friend', 'v1', {}, ip='203.0.113.55')
+    executor_instances.register(node)
+    assert aux_mod.connected_ips() == {'203.0.113.55'}
+    assert _client('203.0.113.55').get('/dashboard').status_code == 200, 'node connected'
+    assert _client('203.0.113.56').get('/dashboard').status_code == 404, 'a neighbour is not'
+
+    executor_instances.unregister(node)
+    assert _client('203.0.113.55').get('/dashboard').status_code == 404, 'access lapses on leave'
+
+
+def test_join_records_the_forwarded_address(pool, monkeypatch):
+    """Through the tunnel the socket peer is cloudflared on loopback, so the node's real
+    address can only come from the forwarded header."""
+    monkeypatch.setattr(aux_mod, 'JOIN_TOKEN', 'sekrit')
+    monkeypatch.setattr(aux_mod, 'code_version', lambda: 'v1')
+
+    class WS(_FakeWS):
+        client = types.SimpleNamespace(host='127.0.0.1')     # cloudflared, not the node
+        headers = {'cf-connecting-ip': '203.0.113.99'}
+
+    async def scenario():
+        hold = asyncio.Event()
+        ws = WS([_hello()], hold=hold)
+        task = asyncio.create_task(aux_mod.handle_join(ws))
+        await asyncio.sleep(0.05)
+        seen = aux_mod.connected_ips()
+        hold.set()
+        await task
+        return seen
+
+    assert asyncio.run(scenario()) == {'203.0.113.99'}
+
+
+def test_translate_endpoints_still_need_the_token(pool, monkeypatch):
+    """The address allowlist applies to the dashboard only — it must not become a way around
+    the access token on the translate surface."""
+    import server.edge as edge
+    monkeypatch.setattr(edge, 'DASHBOARD_NETS', edge._parse_nets('203.0.113.7'))
+    monkeypatch.setattr(edge, 'ACCESS_TOKEN', 'sekrit')
+    r = _client('203.0.113.7').post('/translate/gallery/poll', data={'job_token': 'x', 'since': 0})
+    assert r.status_code == 401, 'an allowlisted address is still not authenticated'
+
+
 # ── AuxInstance frame routing ────────────────────────────────────────────────────────────
 
 def test_frames_route_to_the_right_chunk(pool):

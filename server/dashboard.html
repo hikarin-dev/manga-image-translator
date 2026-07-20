@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shiori translation server — dashboard</title>
+<style>
+  /* Palette roles. Light and dark are each selected steps, not an automatic flip;
+     the media query covers the OS setting and [data-theme] covers a manual toggle. */
+  :root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --plane:          #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --accent:         #2a78d6;   /* sequential hue, single series */
+    --accent-soft:    #cde2fb;
+    --good:           #0ca30c;
+    --warning:        #fab219;
+    --critical:       #d03b3b;
+    --muted-fill:     #e1e0d9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --plane:          #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --gridline:       #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --accent:         #3987e5;
+      --accent-soft:    #184f95;
+      --muted-fill:     #2c2c2a;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --plane:          #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --accent:         #3987e5;
+    --accent-soft:    #184f95;
+    --muted-fill:     #2c2c2a;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: var(--plane); color: var(--text-primary);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0; }
+  .sub { color: var(--text-muted); font-size: 13px; }
+  .spacer { flex: 1; }
+
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px;
+  }
+  .card h2 {
+    font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+    color: var(--text-muted); margin: 0 0 12px;
+  }
+
+  /* KPI row — stat tiles, no plot, so no hover layer needed on these */
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .kpi { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .kpi .label { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+  .kpi .value { font-size: 28px; font-weight: 600; line-height: 1.1; }
+  .kpi .unit { font-size: 14px; font-weight: 400; color: var(--text-muted); margin-left: 2px; }
+  .kpi .note { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+
+  /* Status: always a dot AND a word — never colour alone. */
+  .state { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .dot.good { background: var(--good); }
+  .dot.busy { background: var(--accent); }
+  .dot.warn { background: var(--warning); }
+  .dot.crit { background: var(--critical); }
+  .dot.idle { background: var(--baseline); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--gridline); }
+  th { font-weight: 500; color: var(--text-muted); font-size: 12px; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12px; color: var(--text-secondary); }
+  .scroll { overflow-x: auto; }
+  .empty { color: var(--text-muted); padding: 12px 2px; font-size: 13px; }
+
+  /* Meter: single-hue fill, magnitude against a known maximum. */
+  .meter { height: 8px; background: var(--muted-fill); border-radius: 4px; overflow: hidden; }
+  .meter > span { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+  .meterrow { margin-bottom: 14px; }
+  .meterrow:last-child { margin-bottom: 0; }
+  .meterhead { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px; }
+  .meterhead b { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* Recent-jobs bar strip: one series, so no legend; hover carries the detail. */
+  .bars { display: flex; align-items: flex-end; gap: 2px; height: 64px; }
+  .bar { flex: 1; min-width: 4px; background: var(--accent); border-radius: 4px 4px 0 0; position: relative; }
+  .bar.cancelled { background: var(--muted-fill); }
+  .bar:hover { outline: 2px solid var(--surface-1); }
+  .bar::after {
+    content: attr(data-tip); position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
+    margin-bottom: 6px; padding: 6px 8px; border-radius: 6px; white-space: pre; z-index: 5;
+    background: var(--text-primary); color: var(--surface-1); font-size: 12px;
+    opacity: 0; pointer-events: none; transition: opacity .08s;
+  }
+  .bar:hover::after { opacity: 1; }
+  .axis { display: flex; justify-content: space-between; color: var(--text-muted); font-size: 12px; margin-top: 6px; }
+
+  .err { color: var(--critical); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Shiori translation server</h1>
+    <span class="sub" id="uptime">—</span>
+    <span class="spacer"></span>
+    <span class="sub state"><span class="dot idle" id="livedot"></span><span id="live">connecting…</span></span>
+  </header>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="card">
+    <h2>Executor pool</h2>
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>Node</th><th>Type</th><th>State</th><th>Version</th>
+        <th class="num">Chunks</th><th class="num">Connected</th><th>Hardware</th>
+      </tr></thead>
+      <tbody id="pool"></tbody>
+    </table></div>
+    <div class="empty" id="poolempty" hidden>No executors registered — nothing can run right now.</div>
+  </div>
+
+  <div class="card">
+    <h2>GPU (this machine)</h2>
+    <div id="gpu"></div>
+  </div>
+
+  <div class="card">
+    <h2>Recent jobs</h2>
+    <div id="strip"></div>
+    <div class="scroll" style="margin-top:16px"><table>
+      <thead><tr>
+        <th>Time</th><th>Job</th><th class="num">Pages</th><th class="num">Done</th>
+        <th class="num">Failed</th><th class="num">Wall</th><th class="num">Compute</th>
+        <th class="num">Cost</th><th>Result</th>
+      </tr></thead>
+      <tbody id="jobs"></tbody>
+    </table></div>
+    <div class="empty" id="jobsempty" hidden>No jobs recorded since the server started.</div>
+  </div>
+
+  <p class="sub" id="err"></p>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+const dur = s => {
+  if (s == null) return '—';
+  if (s < 60) return s.toFixed(0) + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + Math.round(s % 60) + 's';
+  const h = Math.floor(s / 3600);
+  return h >= 24 ? Math.floor(h / 24) + 'd ' + (h % 24) + 'h' : h + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+};
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function kpi(label, value, unit, note) {
+  return `<div class="kpi"><div class="label">${esc(label)}</div>
+    <div class="value">${esc(value)}${unit ? `<span class="unit">${esc(unit)}</span>` : ''}</div>
+    ${note ? `<div class="note">${esc(note)}</div>` : ''}</div>`;
+}
+
+function renderKpis(d) {
+  const q = d.queue || {}, w = d.workers || {}, t = d.today || {};
+  const ready = (d.executors || []).filter(e => !e.reserve).length;
+  $('kpis').innerHTML = [
+    kpi('Live jobs', q.live_jobs ?? 0, '', `${q.active ?? 0} active · ${q.waiting ?? 0} waiting`),
+    kpi('Executors', `${w.busy ?? 0}/${w.registered ?? 0}`, '', ready ? `${ready} in normal rotation` : 'fallback only'),
+    kpi('Pages today', t.pages ?? 0, '', `${t.jobs ?? 0} jobs · ${t.pages_failed ?? 0} failed`),
+    kpi('LLM cost today', '$' + (t.llm_cost_usd ?? 0).toFixed(4), '', dur(t.compute_s ?? 0) + ' compute'),
+  ].join('');
+}
+
+function renderPool(list) {
+  const rows = (list || []).map(e => {
+    let cls = 'idle', word = 'Idle';
+    if (e.busy) { cls = 'busy'; word = 'Translating'; }
+    else if (e.reserve) { cls = 'warn'; word = 'Reserve'; }
+    else { cls = 'good'; word = 'Ready'; }
+    const caps = e.caps && e.caps.gpu
+      ? esc(e.caps.device || 'GPU') + (e.caps.vram_mb ? ` · ${(e.caps.vram_mb / 1024).toFixed(0)} GB` : '')
+      : (e.kind === 'local' ? 'this machine' : '—');
+    return `<tr>
+      <td>${esc(e.name || e.id)}</td>
+      <td>${e.kind === 'aux' ? 'Aux node' : 'Local'}</td>
+      <td><span class="state"><span class="dot ${cls}"></span>${word}</span></td>
+      <td class="mono">${esc(e.version || '—')}</td>
+      <td class="num">${e.chunks_done ?? '—'}</td>
+      <td class="num">${dur(e.connected_s)}</td>
+      <td>${caps}</td>
+    </tr>`;
+  });
+  $('pool').innerHTML = rows.join('');
+  $('poolempty').hidden = rows.length > 0;
+}
+
+function renderGpu(g) {
+  if (!g) {
+    $('gpu').innerHTML = `<div class="empty">No local GPU reported (nvidia-smi unavailable).
+      Aux nodes report their own hardware in the pool table above.</div>`;
+    return;
+  }
+  const vramPct = g.vram_total_mb ? (g.vram_used_mb / g.vram_total_mb) * 100 : 0;
+  const meter = (label, pct, detail) => `<div class="meterrow">
+      <div class="meterhead"><span>${label}</span><b>${detail}</b></div>
+      <div class="meter"><span style="width:${Math.max(0, Math.min(100, pct)).toFixed(1)}%"></span></div>
+    </div>`;
+  $('gpu').innerHTML =
+    meter('Utilisation', g.util_pct, g.util_pct + '%') +
+    meter('VRAM', vramPct, `${(g.vram_used_mb / 1024).toFixed(1)} / ${(g.vram_total_mb / 1024).toFixed(1)} GB`);
+}
+
+function renderJobs(list) {
+  const jobs = (list || []).slice().reverse();   // newest first in the table
+  $('jobsempty').hidden = jobs.length > 0;
+
+  // Bar strip: pages per job, oldest → newest. One series, so no legend; hover gives detail.
+  const strip = (list || []);
+  const max = Math.max(1, ...strip.map(j => j.pages || 0));
+  $('strip').innerHTML = strip.length ? `<div class="bars">` + strip.map(j => {
+    const h = Math.max(4, Math.round(((j.pages || 0) / max) * 64));
+    const tip = `${j.pages} pages\n${j.emitted} done${j.failed ? ` · ${j.failed} failed` : ''}\n${dur(j.wall_s)} wall${j.cancelled ? '\ncancelled' : ''}`;
+    return `<div class="bar${j.cancelled ? ' cancelled' : ''}" style="height:${h}px" data-tip="${esc(tip)}"></div>`;
+  }).join('') + `</div><div class="axis"><span>oldest</span><span>pages per job · newest</span></div>` : '';
+
+  $('jobs').innerHTML = jobs.map(j => {
+    const ok = !j.cancelled && !j.failed;
+    const cls = j.cancelled ? 'idle' : (j.failed ? 'warn' : 'good');
+    const word = j.cancelled ? 'Cancelled' : (j.failed ? 'Partial' : 'Complete');
+    return `<tr>
+      <td class="mono">${esc((j.ts || '').replace('T', ' ').slice(5))}</td>
+      <td class="mono">${esc(j.token || '')}</td>
+      <td class="num">${j.pages ?? 0}</td>
+      <td class="num">${j.emitted ?? 0}</td>
+      <td class="num">${j.failed ?? 0}</td>
+      <td class="num">${dur(j.wall_s)}</td>
+      <td class="num">${dur(j.compute_s)}</td>
+      <td class="num">${j.llm_cost_usd ? '$' + j.llm_cost_usd.toFixed(4) : '—'}</td>
+      <td><span class="state"><span class="dot ${cls}"></span>${word}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+let fails = 0;
+async function tick() {
+  try {
+    const r = await fetch('/dashboard/data', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    renderKpis(d);
+    renderPool(d.executors);
+    renderGpu(d.gpu);
+    renderJobs(d.recent_jobs);
+    $('uptime').textContent = 'up ' + dur(d.uptime_s);
+    $('livedot').className = 'dot good';
+    $('live').textContent = 'live · updated ' + new Date().toLocaleTimeString();
+    $('err').textContent = '';
+    fails = 0;
+  } catch (e) {
+    fails++;
+    $('livedot').className = 'dot crit';
+    $('live').textContent = 'not responding';
+    $('err').textContent = `Could not reach /dashboard/data (${e.message}). Retrying…`;
+    $('err').className = 'err';
+  }
+  // Back off when the server is down so a closed laptop isn't hammering a dead port.
+  setTimeout(tick, fails > 3 ? 15000 : 3000);
+}
+tick();
+</script>
+</body>
+</html>

@@ -71,6 +71,21 @@ async def aux_nodes() -> dict:
     """Which nodes are in the pool right now. Local-only: not in edge.PUBLIC_PATHS."""
     return {"executors": aux_pool.nodes()}
 
+@app.get("/dashboard", response_class=HTMLResponse, tags=["ui"])
+async def dashboard() -> HTMLResponse:
+    """Operator dashboard: pool state, queue, today's totals, recent jobs.
+
+    Always available on loopback. Through the tunnel it is address-gated rather than
+    token-gated (a browser navigation cannot carry X-Access-Token): reachable from
+    MT_DASHBOARD_IPS and from whichever aux nodes are connected — see server.edge."""
+    return HTMLResponse(content=(BASE_DIR / "dashboard.html").read_text(encoding="utf-8"))
+
+@app.get("/dashboard/data", tags=["ui"])
+async def dashboard_data() -> dict:
+    """Everything the dashboard polls, in one request so its numbers are from one instant."""
+    gpu = await asyncio.to_thread(stats.gpu_snapshot)
+    return {**stats.snapshot(gpu), "executors": aux_pool.nodes()}
+
 def transform_to_image(ctx):
     # 检查是否使用占位符（在web模式下final.png保存后会设置此标记）
     if hasattr(ctx, 'use_placeholder') and ctx.use_placeholder:
@@ -216,6 +231,11 @@ async def start_gallery(req: Request, image: list[UploadFile] = File(...), confi
         rejected = edge.check_admission(client_ip, len(images))
         if rejected:
             raise HTTPException(rejected[0], detail=rejected[1])
+    # Nothing can run this job: --delegate-only with no aux node connected, or the local worker
+    # died. Refuse now with a message the client can show, rather than accepting a job that
+    # would sit at 0% until the starvation guard eventually errors it.
+    if executor_instances.capacity(gallery=True) == 0:
+        raise HTTPException(503, detail="no translation capacity is connected right now — try again shortly")
     return await start_gallery_job(req, transform_gallery_summary, conf, images, batch_size, job_token)
 
 @app.post("/translate/gallery/poll", response_class=Response, tags=["api", "batch"], response_description="Short poll. Body = a status-7 metadata frame (JSON {cursor,status,state,done,total}) + the page/study frames produced past `since` + the terminal frame once present. All in the body (not headers) so it survives cross-origin reads.")
@@ -386,7 +406,8 @@ def start_translator_client_proc(host: str, port: int, nonce: str, params: Names
     base_path = os.path.dirname(os.path.abspath(__file__))
     parent = os.path.dirname(base_path)
     proc = subprocess.Popen(cmds, cwd=parent)
-    executor_instances.register(ExecutorInstance(ip=host, port=port))
+    executor_instances.register(ExecutorInstance(ip=host, port=port,
+                                                 reserve=getattr(params, 'lazy', False)))
 
     def handle_exit_signals(signal, frame):
         proc.terminate()
@@ -521,6 +542,13 @@ if __name__ == '__main__':
     args.start_instance = True
     proc = prepare(args)
     print("Nonce: "+nonce)
+    if args.lazy:
+        # The worker still starts — it is the fallback for "every aux node went away", and
+        # with --models-ttl it unloads from VRAM while idle, so the GPU is free in practice.
+        print("Lazy mode: the local GPU is held in reserve and used only when no aux node is connected.")
+        if not aux_pool.JOIN_TOKEN:
+            print("  NOTE: MT_AUX_TOKEN is unset, so no aux node can join — everything will run "
+                  "locally until you set it in .env and restart.")
     try:
         uvicorn.run(app, host=args.host, port=args.port)
     except Exception:

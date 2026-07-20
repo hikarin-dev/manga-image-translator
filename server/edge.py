@@ -27,10 +27,20 @@ Config comes from the environment (the repo's gitignored .env is loaded on impor
   MT_MAX_LIVE_JOBS       global live-job cap before "at capacity"     (default 8)
 """
 import hmac
+import ipaddress
 import json
+import logging
 import os
 import time
 from collections import deque
+
+logger = logging.getLogger('edge')
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter('%(levelname)s: [edge] %(message)s'))
+    logger.addHandler(_h)
+    logger.propagate = False
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -59,6 +69,57 @@ PUBLIC_PATHS = {
 }
 _LOOPBACK = {'127.0.0.1', '::1', 'localhost'}
 
+# ── operator dashboard ─────────────────────────────────────────────────────────────────
+# Reachable through the tunnel, but only from an allowlisted address — it exposes the aux
+# roster and a job history carrying client IPs, so it is not merely token-worthy.
+#
+# An IP allowlist is trustworthy HERE specifically because the tunnel is the only way in:
+# there is no forwarded port, so every external request arrives via cloudflared and
+# cf-connecting-ip is set by Cloudflare rather than by the caller. Do not reuse this
+# reasoning if the origin is ever exposed directly.
+#
+# Allowed = MT_DASHBOARD_IPS (exact addresses or CIDR) plus, automatically, the address of
+# every aux node currently connected — a node dials in from the machine its operator is
+# sitting at, so the people lending GPUs can watch the pool without you curating a list.
+DASHBOARD_PATHS = {'/dashboard', '/dashboard/data'}
+
+
+def _parse_nets(raw: str) -> list:
+    nets = []
+    for entry in (raw or '').split(','):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))   # a bare IP becomes a /32
+        except ValueError:
+            pass
+    return nets
+
+
+DASHBOARD_NETS = _parse_nets(os.getenv('MT_DASHBOARD_IPS', ''))
+
+
+def _in_nets(ip: str, nets: list) -> bool:
+    if not ip or not nets:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in nets)
+
+
+def dashboard_allowed(ip: str) -> bool:
+    if _in_nets(ip, DASHBOARD_NETS):
+        return True
+    # Imported lazily: aux_pool pulls in the executor registry, and edge is imported first.
+    try:
+        from server.aux_pool import connected_ips
+        return ip in connected_ips()
+    except Exception:
+        return False
+
 
 class EdgeGate:
     """Pure ASGI middleware (BaseHTTPMiddleware buffers streaming responses; this doesn't).
@@ -86,6 +147,22 @@ class EdgeGate:
                 # web UI (whose endpoints are blocked out here anyway) to the internet.
                 return await self._respond(send, 200, b'Shiori translation server is running.\n',
                                            content_type=b'text/plain; charset=utf-8')
+            if path in DASHBOARD_PATHS:
+                # 404, not 403: a caller who isn't allowlisted learns nothing about the page
+                # existing. Allowlisted callers skip the access token — a browser cannot send
+                # the X-Access-Token header on a plain navigation, so the address IS the
+                # credential here, and anyone sharing that public address (the rest of the
+                # household, the same CGNAT pool) is inside it.
+                if not dashboard_allowed(state['client_ip']):
+                    # Say which address was refused. Without this the operator has no way to
+                    # learn what to allowlist — the response deliberately reveals nothing, and
+                    # a home address is rarely what a "what is my IP" site reports. Bounded
+                    # noise: only dashboard paths reach here.
+                    logger.warning(
+                        f'dashboard refused for {state["client_ip"] or "unknown"} - add it to '
+                        f'MT_DASHBOARD_IPS in .env and restart to allow it')
+                    return await self._reject(send, 404, 'Not found')
+                return await self.app(scope, receive, send)
             if path not in PUBLIC_PATHS:
                 return await self._reject(send, 404, 'Not found')
             if ACCESS_TOKEN and not hmac.compare_digest(headers.get('x-access-token', ''), ACCESS_TOKEN):

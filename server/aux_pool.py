@@ -93,8 +93,10 @@ class AuxInstance:
 
     gallery_only = True
 
-    def __init__(self, ws, name: str, version: str, caps: dict, priority: int = AUX_PRIORITY):
+    def __init__(self, ws, name: str, version: str, caps: dict, priority: int = AUX_PRIORITY,
+                 ip: str = ''):
         self.ws = ws
+        self.ip = ip            # public address it dialled in from; gates dashboard access
         self.name = name
         self.version = version
         self.caps = caps or {}
@@ -175,6 +177,22 @@ class AuxInstance:
         self._pending.clear()
 
 
+def client_ip(ws) -> str:
+    """The node's real address. Through a tunnel the socket peer is cloudflared on loopback,
+    so the forwarded header is the only source of the true origin."""
+    try:
+        return (ws.headers.get('cf-connecting-ip')
+                or (ws.client.host if ws.client else '') or '')
+    except Exception:
+        return ''
+
+
+def connected_ips() -> set:
+    """Addresses of the nodes connected right now. Derived from the live pool rather than
+    accumulated, so access lapses the moment a node disconnects."""
+    return {x.ip for x in executor_instances.list if isinstance(x, AuxInstance) and x.ip}
+
+
 def _reject(reason: str) -> dict:
     return {"ok": False, "error": reason}
 
@@ -215,7 +233,8 @@ async def handle_join(ws) -> None:
             return
 
         inst = AuxInstance(ws, str(hello.get('name') or 'aux'),
-                           str(hello.get('version') or 'unknown'), hello.get('caps') or {})
+                           str(hello.get('version') or 'unknown'), hello.get('caps') or {},
+                           ip=client_ip(ws))
         await ws.send_text(json.dumps({"ok": True, "aux_id": inst.aux_id,
                                        "server_version": code_version()}))
         executor_instances.register(inst)
@@ -259,11 +278,15 @@ def nodes() -> list[dict]:
     out = []
     for x in executor_instances.list:
         if isinstance(x, AuxInstance):
-            out.append({"id": x.aux_id, "name": x.name, "version": x.version,
-                        "busy": x.busy, "priority": x.priority, "caps": x.caps,
+            out.append({"id": x.aux_id, "kind": "aux", "name": x.name, "version": x.version,
+                        "busy": x.busy, "reserve": False, "priority": x.priority, "caps": x.caps,
                         "chunks_done": x.chunks_done,
                         "connected_s": round(time.monotonic() - x.joined_at)})
         else:
-            out.append({"id": "local", "name": getattr(x, 'label', 'local'),
-                        "busy": x.busy, "priority": getattr(x, 'priority', 100)})
+            out.append({"id": "local", "kind": "local", "name": getattr(x, 'label', 'local'),
+                        "version": code_version(), "busy": x.busy,
+                        # True under --lazy: present as a fallback, not part of normal capacity.
+                        "reserve": bool(getattr(x, 'reserve', False)),
+                        "priority": getattr(x, 'priority', 100), "caps": {},
+                        "chunks_done": None, "connected_s": None})
     return out

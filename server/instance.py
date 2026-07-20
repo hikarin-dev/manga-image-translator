@@ -20,6 +20,11 @@ class ExecutorInstance(BaseModel):
     # single-image and batch paths return a pickled Context, which we will not
     # deserialize from a machine we don't own (see server.safe_pickle).
     gallery_only: bool = False
+    # Held back unless it is the only thing left (--lazy sets this on the local worker). Unlike
+    # priority, which only orders the free executors, a reserve executor is not offered work at
+    # all while a non-reserve one exists — even a busy one. That is the difference between
+    # "prefer the aux nodes" and "keep my GPU out of this unless everyone has gone home".
+    reserve: bool = False
 
     @property
     def label(self) -> str:
@@ -71,7 +76,12 @@ class Executors:
                 return
 
     def _eligible(self, gallery: bool) -> List[ExecutorInstance]:
-        return [x for x in self.list if gallery or not getattr(x, 'gallery_only', False)]
+        pool = [x for x in self.list if gallery or not getattr(x, 'gallery_only', False)]
+        # A reserve executor stands in only when nothing else can serve this kind of task. Note
+        # this is evaluated per task kind, so under --lazy the local worker is still the one
+        # that runs single-image work (aux nodes are gallery-only) while sitting out galleries.
+        active = [x for x in pool if not getattr(x, 'reserve', False)]
+        return active if active else pool
 
     def capacity(self, gallery: bool = True) -> int:
         """How many chunks could be in flight at once if everything were free — the
