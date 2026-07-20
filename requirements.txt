@@ -3,6 +3,8 @@ torch
 groq
 torchvision
 torch-summary
+triton-windows<3.3 ; sys_platform == "win32"  # torch.compile/Inductor backend for the 48px_exp OCR (pairs with torch 2.6)
+ai-edge-litert  # LiteRT/TFLite interpreter for the mocr_tflite OCR
 einops
 scikit-image
 opencv-python
@@ -48,6 +50,7 @@ pyhyphen
 langcodes[data]
 manga-ocr
 langdetect
+pykakasi  # furigana (ruby) segmentation for study-mode source text
 # pydensecrf disabled on Windows (no C++ build toolchain); refine_mask falls back gracefully.
 # pydensecrf@https://github.com/lucasb-eyer/pydensecrf/archive/refs/heads/master.zip
 accelerate

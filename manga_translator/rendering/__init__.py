@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 # from .ballon_extractor import extract_ballon_region
 from . import text_render
-from .text_render_eng import render_textblock_list_eng
+from .text_render_eng import render_textblock_list_eng, render_bubble_debug
 from .text_render_pillow_eng import render_textblock_list_eng as render_textblock_list_eng_pillow
 from ..utils import (
     BASE_PATH,
@@ -416,7 +416,7 @@ def render(
     img[y:y+h, x:x+w] = np.clip((img[y:y+h, x:x+w].astype(np.float32) * (1 - mask_region) + canvas_region.astype(np.float32) * mask_region), 0, 255).astype(np.uint8)
     return img
 
-async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False) -> np.ndarray:
+async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False, verbose: bool = False, page_bubbles: List[np.ndarray] = None) -> np.ndarray:
     if len(text_regions) == 0:
         return img_canvas
 
@@ -427,7 +427,7 @@ async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, 
     def _sync():
         # set_font MUST run on the same thread as the render — font faces are thread-local.
         text_render.set_font(font_path)
-        return render_textblock_list_eng(img_canvas, text_regions, line_spacing=line_spacing, size_tol=1.2, original_img=original_img, downscale_constraint=0.8, disable_font_border=disable_font_border)
+        return render_textblock_list_eng(img_canvas, text_regions, line_spacing=line_spacing, size_tol=1.2, original_img=original_img, downscale_constraint=0.8, disable_font_border=disable_font_border, verbose=verbose, page_bubbles=page_bubbles)
     return await run_cpu(_sync)
 
 async def dispatch_eng_render_pillow(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False) -> np.ndarray:

@@ -1,0 +1,70 @@
+[package]
+name = "shiori-renderer"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Python bindings around the vendored koharu-renderer (GPL-3.0, github.com/mayocream/koharu)"
+publish = false
+
+[lib]
+name = "shiori_renderer"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+koharu-renderer = { path = "vendor/koharu-renderer" }
+anyhow = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py39", "anyhow"] }
+
+[workspace]
+members = [".", "vendor/koharu-renderer"]
+resolver = "3"
+
+# Mirrors koharu's [workspace.package] so the vendored crate's `workspace = true`
+# inheritance resolves without touching its Cargo.toml.
+[workspace.package]
+version = "0.61.2"
+edition = "2024"
+description = "Manga translation tools"
+license = "GPL-3.0-only"
+authors = [
+    "Mayo Takanashi <mayo@linux.com>",
+    "Wangchong Zhou <fffonion@gmail.com>",
+]
+readme = "README.md"
+homepage = "https://koharu.rs"
+repository = "https://github.com/mayocream/koharu"
+keywords = ["manga", "ocr", "translation", "deep_learning", "computer_vision"]
+publish = false
+
+# Same versions as koharu's workspace (subset the renderer needs).
+[workspace.dependencies]
+anyhow = "1.0"
+image = "0.25"
+imageproc = "0.27"
+once_cell = "1.21"
+skrifa = "0.43"
+harfrust = "0.10"
+hypher = "0.1.7"
+icu_properties = "2.2"
+icu_segmenter = "2.2"
+jieba-rs = "0.10"
+unicode-bidi = "0.3"
+fontdb = "0.23"
+fontdue = "0.9"
+tiny-skia = "0.12"
+tracing = "0.1"
+blake3 = "1.8"
+tokio = { version = "1.52", features = ["full"] }
+criterion = { version = "0.8", features = ["html_reports"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.imageproc]
+opt-level = 3

@@ -73,7 +73,7 @@ class Model48pxOCR(OfflineOCR):
     # same call with the exact same inputs — runs on it, so OCR results are unchanged.
     _SELF_ORCHESTRATED = True
 
-    async def _infer(self, image: np.ndarray, textlines: List[Quadrilateral], config: OcrConfig, verbose: bool = False, ignore_bubble: int = 0) -> List[TextBlock]:
+    async def _infer(self, image: np.ndarray, textlines: List[Quadrilateral], config: OcrConfig, verbose: bool = False, ignore_bubble: int = 0, result_dir: str = None) -> List[TextBlock]:
         text_height = 48
         max_chunk_size = 16
         threshold = 0.2 if config.prob is None else config.prob
@@ -106,7 +106,7 @@ class Model48pxOCR(OfflineOCR):
                 region[i, :, : W, :]=tmp
                 if verbose:
                     # 保存OCR调试图片，使用优化的保存方式
-                    ocr_result_dir = os.environ.get('MANGA_OCR_RESULT_DIR', 'result/ocrs/')
+                    ocr_result_dir = result_dir or os.environ.get('MANGA_OCR_RESULT_DIR', 'result/ocrs/')
                     os.makedirs(ocr_result_dir, exist_ok=True)
                     
                     # 转换图片数据

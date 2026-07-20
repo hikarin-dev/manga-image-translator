@@ -7,6 +7,30 @@ from shapely.geometry import Polygon
 
 from ..utils import TextBlock, Quadrilateral, quadrilateral_can_merge_region
 
+
+def _majority_direction(textlines: List[Quadrilateral]) -> str:
+    """Choose source direction by line count, then non-whitespace character count."""
+    counts = Counter(line.direction for line in textlines)
+    if len(counts) == 1:
+        return next(iter(counts))
+    horizontal, vertical = counts['h'], counts['v']
+    if horizontal != vertical:
+        return 'h' if horizontal > vertical else 'v'
+
+    char_counts = Counter()
+    for line in textlines:
+        char_counts[line.direction] += sum(not char.isspace() for char in str(line.text or ''))
+    if char_counts['h'] != char_counts['v']:
+        return 'h' if char_counts['h'] > char_counts['v'] else 'v'
+
+    # A fully even vote is rare. Keep the strongest-shaped line as the deterministic fallback.
+    def shape_strength(line):
+        ratio = line.aspect_ratio
+        return max(ratio, 1.0 / ratio) if ratio > 0 else float('inf')
+
+    return max(textlines, key=shape_strength).direction
+
+
 def split_text_region(
         bboxes: List[Quadrilateral],
         connected_region_indices: Set[int],
@@ -146,30 +170,26 @@ def merge_bboxes_text_region(bboxes: List[Quadrilateral], width, height):
         nodes = list(node_set)
         txtlns: List[Quadrilateral] = np.array(bboxes)[nodes]
 
-        # calculate average fg and bg color
-        fg_r = round(np.mean([box.fg_r for box in txtlns]))
-        fg_g = round(np.mean([box.fg_g for box in txtlns]))
-        fg_b = round(np.mean([box.fg_b for box in txtlns]))
-        bg_r = round(np.mean([box.bg_r for box in txtlns]))
-        bg_g = round(np.mean([box.bg_g for box in txtlns]))
-        bg_b = round(np.mean([box.bg_b for box in txtlns]))
+        # A block can merge lines of different colors (another speaker, colored
+        # emphasis words); averaging those blends into a muddy mix, so use the
+        # dominant color by text area instead. Near-identical colors (jitter)
+        # still pool into one group, matching the old averaging for them.
+        def _dominant_color(color_of):
+            groups = []
+            for box in txtlns:
+                color = color_of(box)
+                for group in groups:
+                    if max(abs(int(a) - int(b)) for a, b in zip(color, group[0])) <= 10:
+                        group[1] += box.area
+                        break
+                else:
+                    groups.append([color, box.area])
+            return max(groups, key=lambda g: g[1])[0]
 
-        # majority vote for direction
-        dirs = [box.direction for box in txtlns]
-        majority_dir_top_2 = Counter(dirs).most_common(2)
-        if len(majority_dir_top_2) == 1 :
-            majority_dir = majority_dir_top_2[0][0]
-        elif majority_dir_top_2[0][1] == majority_dir_top_2[1][1] : # if top 2 have the same counts
-            max_aspect_ratio = -100
-            for box in txtlns :
-                if box.aspect_ratio > max_aspect_ratio :
-                    max_aspect_ratio = box.aspect_ratio
-                    majority_dir = box.direction
-                if 1.0 / box.aspect_ratio > max_aspect_ratio :
-                    max_aspect_ratio = 1.0 / box.aspect_ratio
-                    majority_dir = box.direction
-        else :
-            majority_dir = majority_dir_top_2[0][0]
+        fg_r, fg_g, fg_b = _dominant_color(lambda box: (box.fg_r, box.fg_g, box.fg_b))
+        bg_r, bg_g, bg_b = _dominant_color(lambda box: (box.bg_r, box.bg_g, box.bg_b))
+
+        majority_dir = _majority_direction(txtlns)
 
         # sort textlines
         if majority_dir == 'h':
@@ -179,7 +199,7 @@ def merge_bboxes_text_region(bboxes: List[Quadrilateral], width, height):
         txtlns = np.array(bboxes)[nodes]
 
         # yield overall bbox and sorted indices
-        yield txtlns, (fg_r, fg_g, fg_b), (bg_r, bg_g, bg_b)
+        yield txtlns, (fg_r, fg_g, fg_b), (bg_r, bg_g, bg_b), majority_dir
 
 async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verbose: bool = False) -> List[TextBlock]:
     # print(width, height)
@@ -190,7 +210,7 @@ async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verb
     #     print(s)
 
     text_regions: List[TextBlock] = []
-    for (txtlns, fg_color, bg_color) in merge_bboxes_text_region(textlines, width, height):
+    for (txtlns, fg_color, bg_color, majority_dir) in merge_bboxes_text_region(textlines, width, height):
         total_logprobs = 0
         for txtln in txtlns:
             total_logprobs += np.log(txtln.prob) * txtln.area
@@ -204,5 +224,6 @@ async def dispatch(textlines: List[Quadrilateral], width: int, height: int, verb
         texts = [txtln.text for txtln in txtlns]
         region = TextBlock(lines, texts, font_size=font_size, angle=angle, prob=np.exp(total_logprobs),
                            fg_color=fg_color, bg_color=bg_color)
+        region.source_direction = majority_dir
         text_regions.append(region)
     return text_regions

@@ -55,7 +55,7 @@ class Model32pxOCR(OfflineOCR):
     async def _unload(self):
         del self.model
 
-    async def _infer(self, image: np.ndarray, textlines: List[Quadrilateral], config: OcrConfig, verbose: bool = False) -> List[TextBlock]:
+    async def _infer(self, image: np.ndarray, textlines: List[Quadrilateral], config: OcrConfig, verbose: bool = False, result_dir: str = None) -> List[TextBlock]:
         text_height = 32
         max_chunk_size = 16
         ignore_bubble = config.ignore_bubble
@@ -86,11 +86,12 @@ class Model32pxOCR(OfflineOCR):
                     continue
                 region[i, :, : W, :]=tmp
                 if verbose:
-                    os.makedirs('result/ocrs/', exist_ok=True)
+                    ocr_result_dir = result_dir or os.environ.get('MANGA_OCR_RESULT_DIR', 'result/ocrs/')
+                    os.makedirs(ocr_result_dir, exist_ok=True)
                     if quadrilaterals[idx][1] == 'v':
-                        cv2.imwrite(f'result/ocrs/{ix}.png', cv2.rotate(cv2.cvtColor(region[i, :, :, :], cv2.COLOR_RGB2BGR), cv2.ROTATE_90_CLOCKWISE))
+                        cv2.imwrite(os.path.join(ocr_result_dir, f'{ix}.png'), cv2.rotate(cv2.cvtColor(region[i, :, :, :], cv2.COLOR_RGB2BGR), cv2.ROTATE_90_CLOCKWISE))
                     else:
-                        cv2.imwrite(f'result/ocrs/{ix}.png', cv2.cvtColor(region[i, :, :, :], cv2.COLOR_RGB2BGR))
+                        cv2.imwrite(os.path.join(ocr_result_dir, f'{ix}.png'), cv2.cvtColor(region[i, :, :, :], cv2.COLOR_RGB2BGR))
                 ix += 1
             image_tensor = (torch.from_numpy(region).float() - 127.5) / 127.5
             image_tensor = einops.rearrange(image_tensor, 'N H W C -> N C H W')

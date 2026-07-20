@@ -3,16 +3,24 @@ from typing import List, Optional
 from .common import CommonOCR, OfflineOCR
 from .model_32px import Model32pxOCR
 from .model_48px import Model48pxOCR
+from .model_48px_exp import Model48pxExpOCR
 from .model_48px_ctc import Model48pxCTCOCR
 from .model_manga_ocr import ModelMangaOCR
+from .model_manga_ocr_fast import ModelMangaOCRFast
+from .model_manga_ocr_tflite import ModelMangaOCRTflite
+from .model_oneocr import OneOcrOCR
 from ..config import Ocr, OcrConfig
 from ..utils import Quadrilateral
 
 OCRS = {
     Ocr.ocr32px: Model32pxOCR,
     Ocr.ocr48px: Model48pxOCR,
+    Ocr.ocr48px_exp: Model48pxExpOCR,
     Ocr.ocr48px_ctc: Model48pxCTCOCR,
     Ocr.mocr: ModelMangaOCR,
+    Ocr.mocr_fast: ModelMangaOCRFast,
+    Ocr.mocr_tflite: ModelMangaOCRTflite,
+    Ocr.oneocr: OneOcrOCR,
 }
 ocr_cache = {}
 
@@ -30,12 +38,12 @@ async def prepare(ocr_key: Ocr, device: str = 'cpu'):
         await ocr.download()
         await ocr.load(device)
 
-async def dispatch(ocr_key: Ocr, image: np.ndarray, regions: List[Quadrilateral], config:Optional[OcrConfig] = None, device: str = 'cpu', verbose: bool = False) -> List[Quadrilateral]:
+async def dispatch(ocr_key: Ocr, image: np.ndarray, regions: List[Quadrilateral], config:Optional[OcrConfig] = None, device: str = 'cpu', verbose: bool = False, result_dir: str = None) -> List[Quadrilateral]:
     ocr = get_ocr(ocr_key)
     if isinstance(ocr, OfflineOCR):
         await ocr.load(device)
     config = config or OcrConfig()
-    return await ocr.recognize(image, regions, config, verbose)
+    return await ocr.recognize(image, regions, config, verbose, result_dir=result_dir)
 
 async def unload(ocr_key: Ocr):
     ocr_cache.pop(ocr_key, None)

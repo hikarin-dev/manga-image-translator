@@ -30,6 +30,7 @@ from .utils import (
 from .detection import dispatch as dispatch_detection, prepare as prepare_detection, unload as unload_detection
 from .upscaling import dispatch as dispatch_upscaling, prepare as prepare_upscaling, unload as unload_upscaling
 from .ocr import dispatch as dispatch_ocr, prepare as prepare_ocr, unload as unload_ocr
+from .ocr.colors import apply_estimated_colors
 from .textline_merge import dispatch as dispatch_textline_merge
 from .mask_refinement import dispatch as dispatch_mask_refinement
 from .inpainting import dispatch as dispatch_inpainting, prepare as prepare_inpainting, unload as unload_inpainting
@@ -40,8 +41,9 @@ from .translators import (
 )
 from .translators.common import ISO_639_1_TO_VALID_LANGUAGES
 from .colorization import dispatch as dispatch_colorization, prepare as prepare_colorization, unload as unload_colorization
-from .rendering import dispatch as dispatch_rendering, dispatch_eng_render, dispatch_eng_render_pillow
-from .utils.executors import run_cpu, submit_gpu, prewarm_proc_pool
+from .rendering import dispatch as dispatch_rendering, dispatch_eng_render, dispatch_eng_render_pillow, render_bubble_debug
+from .rendering.shiori_render import dispatch_shiori_render, dispatch_shiori_render_v2
+from .utils.executors import run_cpu, run_proc, submit_gpu, prewarm_proc_pool
 from .utils.profiling import Profiler
 
 # Will be overwritten by __main__.py if module is being run directly (with python -m)
@@ -88,11 +90,191 @@ def load_dictionary(file_path):
 
 def apply_dictionary(text, dictionary):
     for pattern, value, line_number in dictionary:
-        original_text = text  
+        original_text = text
         text = pattern.sub(value, text)
-        if text != original_text:  
+        if text != original_text:
             logger.info(f'Line {line_number}: Replaced "{original_text}" with "{text}" using pattern "{pattern.pattern}" and value "{value}"')
     return text
+
+
+# ── study-layer builders (module-level so they run in the GIL-free process pool) ──────────
+# text_and_image study mode partitions the final render's changed pixels among a page's bubbles
+# and encodes a full-page transparent layer per bubble + the shared inpaint bg: per-bubble numpy
+# fills + PNG/WebP encodes + base64. On the thread pool that Python-heavy work holds the GIL and
+# serializes the whole pipeline (study_overlay measured ~40% of a dense gallery's wall, with CPU
+# cores idle — the GIL-serialization tell). Running it out-of-process (like mask refinement) frees
+# the GIL. These are module-level, not closures/methods, so ProcessPoolExecutor can pickle them.
+
+def _study_norm(x1, y1, x2, y2, W, H):
+    return {'x': x1 / W, 'y': y1 / H, 'w': (x2 - x1) / W, 'h': (y2 - y1) / H}
+
+
+def _study_meta_bubble(info, region_xyxy, W, H):
+    """Per-bubble geometry + text + style, normalized to the page. Reads no pixels."""
+    dx1, dy1, dx2, dy2 = info['det']
+    bx1, by1, bx2, by2 = info['rbox']
+    bubble = {
+        'box': _study_norm(dx1, dy1, dx2, dy2, W, H),
+        'rbox': _study_norm(bx1, by1, bx2, by2, W, H),
+        'region': _study_norm(*region_xyxy, W, H),
+        'tr': info['tr'], 'src': info['src'], 'style': info['style'],
+    }
+    # Optional DOM-text metadata: per-source-line ruby segments and the rect where the renderer
+    # pasted its glyph canvas.
+    for k in ('furi',):
+        if info.get(k):
+            bubble[k] = info[k]
+    if info.get('tbox'):
+        bubble['tbox'] = _study_norm(*info['tbox'], W, H)
+    return bubble
+
+
+# ── furigana (ruby) segmentation for study-mode source text ───────────────────────────────
+# pykakasi splits Japanese text into words with kana readings; each source line becomes a list of
+# [text, reading|None] segments where a reading covers only the kanji run (shared kana at the
+# word's edges — okurigana/prefixes — are trimmed out of the ruby). The reader decides whether
+# to SHOW furigana (it gates on the gallery's language), so this only skips work when the text
+# plainly has no kanji or pykakasi isn't installed.
+
+_KAKASI = None
+
+
+def _has_kanji(s):
+    # CJK unified ideographs (incl. ext. A) + compatibility ideographs + iteration marks.
+    return any('㐀' <= c <= '鿿' or '豈' <= c <= '﫿' or c in '々〆' for c in s)
+
+
+def _furi_seg_append(segs, text, ruby):
+    """Append a segment, merging consecutive no-ruby runs to keep the payload compact."""
+    if ruby is None and segs and segs[-1][1] is None:
+        segs[-1][0] += text
+    else:
+        segs.append([text, ruby])
+
+
+def _furi_lines(lines):
+    """Per-line ruby segments for `lines`, or None when nothing gets a reading."""
+    global _KAKASI
+    if not any(_has_kanji(line) for line in lines):
+        return None
+    if _KAKASI is None:
+        try:
+            import pykakasi
+            _KAKASI = pykakasi.kakasi()
+        except Exception:
+            _KAKASI = False
+    if _KAKASI is False:
+        return None
+    out = []
+    any_ruby = False
+    for line in lines:
+        segs = []
+        try:
+            items = _KAKASI.convert(line)
+        except Exception:
+            items = []
+        if not items:
+            segs.append([line, None])
+            out.append(segs)
+            continue
+        for item in items:
+            orig = item.get('orig') or ''
+            hira = item.get('hira') or ''
+            if not orig:
+                continue
+            if not hira or not _has_kanji(orig):
+                _furi_seg_append(segs, orig, None)
+                continue
+            # Trim kana the word shares with its reading at both ends so the ruby sits over
+            # the kanji only (お預け/おあずけ → お + 預け⟨あず⟩… etc.).
+            p = 0
+            while p < len(orig) and p < len(hira) and orig[p] == hira[p]:
+                p += 1
+            s = 0
+            while s < len(orig) - p and s < len(hira) - p and orig[len(orig) - 1 - s] == hira[len(hira) - 1 - s]:
+                s += 1
+            core_o, core_h = orig[p:len(orig) - s], hira[p:len(hira) - s]
+            if not core_o or not core_h:
+                _furi_seg_append(segs, orig, None)
+                continue
+            if p:
+                _furi_seg_append(segs, orig[:p], None)
+            _furi_seg_append(segs, core_o, core_h)
+            any_ruby = True
+            if s:
+                _furi_seg_append(segs, orig[len(orig) - s:], None)
+        out.append(segs)
+    return out if any_ruby else None
+
+
+def _study_img_data_url(arr, mode_, fmt='PNG', **save_kw):
+    import io as _io
+    import base64
+    buf = _io.BytesIO()
+    Image.fromarray(arr, mode_).save(buf, format=fmt, **save_kw)
+    mime = 'image/webp' if fmt == 'WEBP' else 'image/png'
+    return f'data:{mime};base64,' + base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+def _build_page_layers_job(rendered, inpainted, infos, W, H):
+    """CPU-bound study layers for one page — the process-pool job. EXACTNESS INVARIANT
+    (unchanged): every pixel where the final render differs from the inpaint is assigned to
+    exactly ONE bubble, whose layer stores the final render's RGB at full alpha, so reassembling
+    all bubble layers over the inpaint reproduces the final page pixel-for-pixel. Ownership is
+    per pixel: the render box that contains it (nearest box center on overlap), else the nearest
+    render box — so adjacent bubbles split cleanly at their boundary."""
+    diff = np.abs(rendered.astype(np.int16) - inpainted.astype(np.int16)).max(axis=2)
+    changed = diff > 0
+    # Defensive: a renderer that perturbs untouched pixels (full-page roundtrip) would mark
+    # everything changed; fall back to the visible-change threshold in that case.
+    if changed.mean() > 0.35:
+        changed = diff > 8
+    ys, xs = np.nonzero(changed)
+    if xs.size == 0:
+        return None
+
+    xf = xs.astype(np.float32)
+    yf = ys.astype(np.float32)
+    best_d = np.full(xs.shape, np.inf, dtype=np.float32)
+    owner = np.zeros(xs.shape, dtype=np.int32)
+    for ri, info in enumerate(infos):
+        bx1, by1, bx2, by2 = info['rbox']
+        # squared rect-distance to the render box (0 inside) + a tiny center-distance term that
+        # deterministically breaks ties between overlapping boxes.
+        dx = np.maximum(np.maximum(bx1 - xf, 0.0), xf - (bx2 - 1))
+        dy = np.maximum(np.maximum(by1 - yf, 0.0), yf - (by2 - 1))
+        d = dx * dx + dy * dy
+        cx, cy = (bx1 + bx2) * 0.5, (by1 + by2) * 0.5
+        d += ((xf - cx) ** 2 + (yf - cy) ** 2) * np.float32(1e-7)
+        m = d < best_d
+        best_d[m] = d[m]
+        owner[m] = ri
+
+    bubbles = []
+    for ri, info in enumerate(infos):
+        sel = owner == ri
+        if not sel.any():
+            continue
+        rx, ry = xs[sel], ys[sel]
+        gx1, gy1 = int(rx.min()), int(ry.min())
+        gx2, gy2 = int(rx.max()) + 1, int(ry.max()) + 1
+        # Full-page transparent layer holding exactly this bubble's pixels: RGB from the final
+        # render (antialiasing against the inpaint already baked in), alpha 255 so compositing
+        # over the inpaint bg reproduces the render exactly.
+        text_rgba = np.zeros((H, W, 4), dtype=np.uint8)
+        text_rgba[ry, rx, :3] = rendered[ry, rx]
+        text_rgba[ry, rx, 3] = 255
+        # bg clip region = detection box unioned with the full glyph extent.
+        dx1, dy1, dx2, dy2 = info['det']
+        bubble = _study_meta_bubble(info, (min(dx1, gx1), min(dy1, gy1), max(dx2, gx2), max(dy2, gy2)), W, H)
+        bubble['text'] = _study_img_data_url(text_rgba, 'RGBA', 'PNG')
+        bubbles.append(bubble)
+    if not bubbles:
+        return None
+    # Shared inpaint bg is opaque art (no text) → WebP is far smaller than PNG at quality the eye
+    # can't tell apart, and it only ever shows behind a revealed bubble.
+    bg = _study_img_data_url(inpainted, 'RGB', 'WEBP', quality=90, method=6)
+    return {'page': {'w': W, 'h': H}, 'bg': bg, 'bubbles': bubbles}
 
 class MangaTranslator:
     verbose: bool
@@ -385,18 +567,21 @@ class MangaTranslator:
 
         # 设置图片上下文以生成调试图片子文件夹
         self._set_image_context(config, image)
-        
+        # Pin this page's context onto the ctx so every debug dump resolves its folder from the
+        # ctx even if another page mutates self._current_image_context mid-flight.
+        ctx.image_context = dict(self._current_image_context)
+
         # 保存debug文件夹信息到Context中（用于Web模式的缓存访问）
         # 在web模式下总是保存，不仅仅是verbose模式
         ctx.debug_folder = self._get_image_subfolder()
-        
+
         # 保存原始输入图片用于调试
         if self.verbose:
             try:
                 input_img = np.array(image)
                 if len(input_img.shape) == 3:  # 彩色图片，转换BGR顺序
                     input_img = cv2.cvtColor(input_img, cv2.COLOR_RGB2BGR)
-                result_path = self._result_path('input.png')
+                result_path = self._result_path('input.png', ctx)
                 success = cv2.imwrite(result_path, input_img)
                 if not success:
                     logger.warning(f"Failed to save debug image: {result_path}")
@@ -482,7 +667,7 @@ class MangaTranslator:
             ctx.mask = None
 
         if self.verbose and ctx.mask_raw is not None:
-            cv2.imwrite(self._result_path('mask_raw.png'), ctx.mask_raw)
+            cv2.imwrite(self._result_path('mask_raw.png', ctx), ctx.mask_raw)
 
         if not ctx.textlines:
             await self._report_progress('skip-no-regions', True)
@@ -494,7 +679,7 @@ class MangaTranslator:
             img_bbox_raw = np.copy(ctx.img_rgb)
             for txtln in ctx.textlines:
                 cv2.polylines(img_bbox_raw, [txtln.pts], True, color=(255, 0, 0), thickness=2)
-            cv2.imwrite(self._result_path('bboxes_unfiltered.png'), cv2.cvtColor(img_bbox_raw, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(self._result_path('bboxes_unfiltered.png', ctx), cv2.cvtColor(img_bbox_raw, cv2.COLOR_RGB2BGR))
 
         # -- OCR
         await self._report_progress('ocr')
@@ -526,7 +711,7 @@ class MangaTranslator:
             show_panels = not config.force_simple_sort  # 当不使用简单排序时显示panel
             bboxes = visualize_textblocks(cv2.cvtColor(ctx.img_rgb, cv2.COLOR_BGR2RGB), ctx.text_regions, 
                                         show_panels=show_panels, img_rgb=ctx.img_rgb, right_to_left=config.render.rtl)
-            cv2.imwrite(self._result_path('bboxes.png'), bboxes)
+            cv2.imwrite(self._result_path('bboxes.png', ctx), bboxes)
 
         # Apply pre-dictionary after textline merge
         pre_dict = load_dictionary(self.pre_dict)
@@ -580,8 +765,8 @@ class MangaTranslator:
         if self.verbose and ctx.mask is not None:
             inpaint_input_img = await dispatch_inpainting(Inpainter.none, ctx.img_rgb, ctx.mask, config.inpainter,config.inpainter.inpainting_size,
                                                           self.device, self.verbose)
-            cv2.imwrite(self._result_path('inpaint_input.png'), cv2.cvtColor(inpaint_input_img, cv2.COLOR_RGB2BGR))
-            cv2.imwrite(self._result_path('mask_final.png'), ctx.mask)
+            cv2.imwrite(self._result_path('inpaint_input.png', ctx), cv2.cvtColor(inpaint_input_img, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(self._result_path('mask_final.png', ctx), ctx.mask)
 
         # -- Inpainting
         await self._report_progress('inpainting')
@@ -602,7 +787,7 @@ class MangaTranslator:
 
         if self.verbose:
             try:
-                inpainted_path = self._result_path('inpainted.png')
+                inpainted_path = self._result_path('inpainted.png', ctx)
                 success = cv2.imwrite(inpainted_path, cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR))
                 if not success:
                     logger.warning(f"Failed to save debug image: {inpainted_path}")
@@ -613,10 +798,10 @@ class MangaTranslator:
         await self._report_progress('rendering')
 
         # 在rendering状态后立即发送文件夹信息，用于前端精确检查final.png
-        if hasattr(self, '_progress_hooks') and self._current_image_context:
-            folder_name = self._current_image_context['subfolder']
+        ic = getattr(ctx, 'image_context', None) or self._current_image_context
+        if hasattr(self, '_progress_hooks') and ic:
             # 发送特殊格式的消息，前端可以解析
-            await self._report_progress(f'rendering_folder:{folder_name}')
+            await self._report_progress(f"rendering_folder:{ic['subfolder']}")
 
         try:
             ctx.img_rendered = await self._run_text_rendering(config, ctx)
@@ -644,7 +829,7 @@ class MangaTranslator:
                 final_img = np.array(ctx.result)
                 if len(final_img.shape) == 3:  # 彩色图片，转换BGR顺序
                     final_img = cv2.cvtColor(final_img, cv2.COLOR_RGB2BGR)
-                final_path = self._result_path('final.png')
+                final_path = self._result_path('final.png', ctx)
                 success = cv2.imwrite(final_path, final_img)
                 if not success:
                     logger.warning(f"Failed to save debug image: {final_path}")
@@ -658,12 +843,12 @@ class MangaTranslator:
             final_img = np.array(ctx.result)
             if len(final_img.shape) == 3:  # 彩色图片，转换BGR顺序
                 final_img = cv2.cvtColor(final_img, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(self._result_path('final.png'), final_img)
+            cv2.imwrite(self._result_path('final.png', ctx), final_img)
 
             # 通知前端文件已就绪
-            if hasattr(self, '_progress_hooks') and self._current_image_context:
-                folder_name = self._current_image_context['subfolder']
-                await self._report_progress(f'final_ready:{folder_name}')
+            ic = getattr(ctx, 'image_context', None) or self._current_image_context
+            if hasattr(self, '_progress_hooks') and ic:
+                await self._report_progress(f"final_ready:{ic['subfolder']}")
 
             # 创建占位符结果并立即返回
             from PIL import Image
@@ -744,36 +929,28 @@ class MangaTranslator:
         self._model_usage_timestamps[("ocr", config.ocr.ocr)] = current_time
         
         # 为OCR创建子文件夹（只在verbose模式下）
+        # The line-crop folder is resolved from this page's own ctx and handed down the dispatch
+        # chain explicitly — the old MANGA_OCR_RESULT_DIR env-var handoff was process-global and
+        # raced when several pages OCR'd concurrently in the gallery pipeline (crops from all
+        # pages clobbered each other in one flat folder).
         if self.verbose:
-            image_subfolder = self._get_image_subfolder()
-            if image_subfolder:
-                if self.result_sub_folder:
-                    ocr_result_dir = os.path.join(BASE_PATH, 'result', self.result_sub_folder, image_subfolder, 'ocrs')
-                else:
-                    ocr_result_dir = os.path.join(BASE_PATH, 'result', image_subfolder, 'ocrs')
-                os.makedirs(ocr_result_dir, exist_ok=True)
-            else:
-                ocr_result_dir = os.path.join(BASE_PATH, 'result', self.result_sub_folder, 'ocrs')
-                os.makedirs(ocr_result_dir, exist_ok=True)
+            ocr_result_dir = self._result_path('ocrs', ctx)
+            os.makedirs(ocr_result_dir, exist_ok=True)
         else:
-            # 非verbose模式下使用临时目录或不创建OCR结果目录
             ocr_result_dir = None
-        
-        # 临时设置环境变量供OCR模块使用
-        old_ocr_dir = os.environ.get('MANGA_OCR_RESULT_DIR', None)
-        if ocr_result_dir:
-            os.environ['MANGA_OCR_RESULT_DIR'] = ocr_result_dir
-        
-        try:
-            t0 = time.perf_counter()
-            textlines = await dispatch_ocr(config.ocr.ocr, ctx.img_rgb, ctx.textlines, config.ocr, self.device, self.verbose)
-            self._accum_time('ocr', time.perf_counter() - t0)
-        finally:
-            # 恢复环境变量
-            if old_ocr_dir is not None:
-                os.environ['MANGA_OCR_RESULT_DIR'] = old_ocr_dir
-            elif 'MANGA_OCR_RESULT_DIR' in os.environ:
-                del os.environ['MANGA_OCR_RESULT_DIR']
+
+        t0 = time.perf_counter()
+        textlines = await dispatch_ocr(config.ocr.ocr, ctx.img_rgb, ctx.textlines, config.ocr, self.device, self.verbose,
+                                       result_dir=ocr_result_dir)
+        self._accum_time('ocr', time.perf_counter() - t0)
+
+        if config.render.estimate_font_color or config.render.estimate_outline_color:
+            try:
+                apply_estimated_colors(ctx.img_rgb, [t for t in textlines if t.text.strip()],
+                                       config.render.estimate_font_color, config.render.estimate_outline_color,
+                                       text_mask=ctx.mask_raw)
+            except Exception:
+                logger.warning('Post-OCR color estimation failed', exc_info=True)
 
         new_textlines = []
         for textline in textlines:
@@ -1132,7 +1309,7 @@ class MangaTranslator:
                 label = 'EXPLICIT' if flag else 'clean   '
                 lines.append(
                     f'{i:<4}  {label}  {text[:35]:<35}  {fallback[:35]:<35}  {final}')
-            with open(self._result_path('content_screen.txt'), 'w', encoding='utf-8') as f:
+            with open(self._result_path('content_screen.txt', ctx), 'w', encoding='utf-8') as f:
                 f.write('\n'.join(lines) + '\n')
         except Exception as e:
             logger.warning(f'Content screen: failed to write log: {e}')
@@ -1456,16 +1633,35 @@ class MangaTranslator:
     async def _run_text_rendering(self, config: Config, ctx: Context):
         current_time = time.time()
         self._model_usage_timestamps[("rendering", config.render.renderer)] = current_time
+        # Sample each region's clean (inpainted) bubble background so get_font_colors can
+        # snap a spurious low-contrast outline to it. Read by every get_font_colors-based
+        # renderer — including shiori while it takes OCR colors; none ignores it.
+        # (original, for when shiori goes back to model colors:)
+        # if ctx.text_regions and config.render.renderer not in (Renderer.none, Renderer.shiori):
+        if ctx.text_regions and config.render.renderer is not Renderer.none:
+            inpainted = ctx.img_inpainted
+            ih, iw = inpainted.shape[:2]
+            for region in ctx.text_regions:
+                x1, y1, x2, y2 = (int(v) for v in region.xyxy)
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(iw, x2), min(ih, y2)
+                if x2 > x1 and y2 > y1:
+                    crop = inpainted[y1:y2, x1:x2].reshape(-1, inpainted.shape[-1])
+                    region._bubble_bg = np.median(crop, axis=0)
         t0 = time.perf_counter()
         if config.render.renderer == Renderer.none:
             output = ctx.img_inpainted
+        elif config.render.renderer == Renderer.shiori and ctx.text_regions:
+            output = await dispatch_shiori_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, device=self.device, verbose=self.verbose)
+        elif config.render.renderer == Renderer.shioriV2 and ctx.text_regions:
+            output = await dispatch_shiori_render_v2(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing, device=self.device, verbose=self.verbose)
         # manga2eng currently only supports horizontal left to right rendering
         elif (config.render.renderer == Renderer.manga2Eng or config.render.renderer == Renderer.manga2EngPillow) and ctx.text_regions and LANGUAGE_ORIENTATION_PRESETS.get(ctx.text_regions[0].target_lang) == 'h':
             if config.render.renderer == Renderer.manga2EngPillow:
                 output = await dispatch_eng_render_pillow(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing)
             else:
                 try:
-                    output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing)
+                    output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing, verbose=self.verbose)
                 except Exception as e:
                     # Freetype path failed (e.g. a face/glyph fault on this page) — retry the page
                     # with the Pillow renderer before giving up; a second failure raises as before.
@@ -1475,17 +1671,41 @@ class MangaTranslator:
             output = await dispatch_rendering(ctx.img_inpainted, ctx.text_regions, self.font_path, config.render.font_size,
                                               config.render.font_size_offset,
                                               config.render.font_size_minimum, not config.render.no_hyphenation, ctx.render_mask, config.render.line_spacing)
+        # Verbose dump of the balloon each eng-rendered region used and how it was fitted, drawn
+        # over the rendered output so the overlay shows the translated text inside its balloon.
+        # The path MUST come from this page's own context: in the gallery pipeline several pages
+        # are in flight at once and the mutable self._current_image_context belongs to whichever
+        # page preprocessed last, so routing through self._result_path() directly sent most
+        # pages' bubbles.png into one folder, overwriting each other.
+        if self.verbose and ctx.text_regions and any(getattr(r, '_bubble_source', None) is not None for r in ctx.text_regions):
+            try:
+                rp = getattr(ctx, 'result_path_callback', None)
+                if rp is not None:
+                    bubbles_path = rp('bubbles.png')
+                else:
+                    bubbles_path = self._result_path('bubbles.png', ctx)
+                cv2.imwrite(bubbles_path, render_bubble_debug(output, ctx.text_regions))
+            except Exception as e:
+                logger.warning(f'failed to write bubble debug overlay: {e}')
         self._accum_time('rendering', time.perf_counter() - t0)
         return output
 
-    def _result_path(self, path: str) -> str:
+    def _result_path(self, path: str, ctx: Context = None) -> str:
         """
         Returns path to result folder where intermediate images are saved when using verbose flag
         or web mode input/result images are cached.
+
+        When `ctx` carries a per-page `image_context` it takes priority: in the gallery pipeline
+        several pages are in flight at once and the mutable self._current_image_context belongs to
+        whichever page preprocessed last, so any dump routed through it can land in (and overwrite)
+        another page's folder.
         """
+        ic = getattr(ctx, 'image_context', None) if ctx is not None else None
+        if not ic:
+            ic = self._current_image_context
         # 只有在verbose模式下才使用图片级子文件夹
         if self.verbose:
-            image_subfolder = self._get_image_subfolder()
+            image_subfolder = ic['subfolder'] if ic else ''
             if image_subfolder:
                 if self.result_sub_folder:
                     result_path = os.path.join(BASE_PATH, 'result', self.result_sub_folder, image_subfolder, path)
@@ -1494,13 +1714,13 @@ class MangaTranslator:
                 # 确保目录存在
                 os.makedirs(os.path.dirname(result_path), exist_ok=True)
                 return result_path
-        
+
         # 在server/web模式下（result_sub_folder为空）且为非verbose模式时
         # 需要创建一个子文件夹来保存final.png
         if not self.result_sub_folder:
-            if self._current_image_context:
+            if ic:
                 # 直接使用已生成的子文件夹名
-                sub_folder = self._current_image_context['subfolder']
+                sub_folder = ic['subfolder']
             else:
                 # 没有上下文信息时使用默认值
                 timestamp = str(int(time.time() * 1000))
@@ -1565,14 +1785,12 @@ class MangaTranslator:
 
         For text_and_image the glyphs are lifted out of the SINGLE final render
         (ctx.img_rendered = inpaint + every region's text drawn together) by PARTITIONING
-        every changed pixel among the bubbles (see _build_page_layers): reassembling all
+        every changed pixel among the bubbles (see _build_page_layers_job): reassembling all
         bubble layers over the inpaint reproduces the final page pixel-for-pixel — no
         cropping, no bleed, no double-draw. The whole page (diff, ownership, per-bubble
         layers, encodes) runs as ONE CPU-pool job instead of one per bubble.
-        Returns None when there's nothing to show."""
-        import io as _io
-        import base64
-
+        Returns None when there's nothing to show. The pixel partition + encodes run in the
+        GIL-free process pool (see _build_page_layers_job)."""
         inpainted = getattr(ctx, 'img_inpainted', None)
         rendered = getattr(ctx, 'img_rendered', None)
         regions = getattr(ctx, 'text_regions', None)
@@ -1593,27 +1811,56 @@ class MangaTranslator:
                     hints['fontSize'] = fs
             except Exception:
                 pass
-            if _is_m2e:
+            try:
+                # The ORIGINAL text's detected size (pre-render), for typesetting the source
+                # as DOM text at its own scale rather than the translation's.
+                sfs = int(getattr(r, 'font_size', 0) or 0)
+                if sfs > 0:
+                    hints['srcFontSize'] = sfs
+            except Exception:
+                pass
+            if _is_m2e or getattr(r, '_typeset_eng', False):
                 # manga2eng letters in comic caps with a tight line advance (~0.8×size) and a
-                # white border — hint it so DOM text can mimic the typesetting.
+                # white border — hint it so DOM text can mimic the typesetting. shiori v2 marks
+                # the regions it routed through the eng fit with _typeset_eng.
                 hints['caps'] = True
             try:
-                fg, bg = r.get_font_colors()
+                # One fg/bg pair, always the colors the render pass actually drew with:
+                # renderers that record them (_drawn_fg/_drawn_bg) win over the OCR-derived
+                # colors; both the original and the translation DOM text share this pair.
+                fg = getattr(r, '_drawn_fg', None)
+                bg = getattr(r, '_drawn_bg', None)
+                if fg is None or bg is None:
+                    fg, bg = r.get_font_colors()
                 hints['fg'] = [int(c) for c in np.clip(np.asarray(fg), 0, 255)]
                 hints['bg'] = [int(c) for c in np.clip(np.asarray(bg), 0, 255)]
             except Exception:
                 pass
-            for key, attr in (('align', 'alignment'), ('dir', 'direction')):
-                try:
-                    v = getattr(r, attr, None)
-                    if isinstance(v, str):
-                        hints[key] = v
-                except Exception:
-                    pass
+            try:
+                align = getattr(r, 'alignment', None)
+                if isinstance(align, str):
+                    hints['align'] = align
+            except Exception:
+                pass
+            try:
+                direction = getattr(r, 'source_direction', None)
+                if direction not in ('h', 'v'):
+                    direction = getattr(r, 'direction', None)
+                if isinstance(direction, str):
+                    hints['dir'] = direction
+            except Exception:
+                pass
             try:
                 ls = getattr(r, 'line_spacing', None)
                 if ls:
                     hints['lineSpacing'] = float(ls)
+            except Exception:
+                pass
+            try:
+                # The pitch the renderer actually drew lines at, as a line-height ratio.
+                dlh = getattr(r, '_drawn_line_height', None)
+                if dlh:
+                    hints['lineH'] = float(dlh)
             except Exception:
                 pass
             return hints
@@ -1643,25 +1890,38 @@ class MangaTranslator:
             bx2 = min(W, bx2 + 6); by2 = min(H, by2 + 6)
             if bx2 <= bx1 or by2 <= by1:
                 bx1, by1, bx2, by2 = dx1, dy1, dx2, dy2
-            infos.append({
+            src_lines = []
+            try:
+                for line in (getattr(r, 'texts', None) or []):
+                    line = str(line)
+                    if line.strip():
+                        src_lines.append(line)
+            except Exception:
+                src_lines = []
+            src = '\n'.join(src_lines) if src_lines else (getattr(r, 'text', '') or '')
+            info = {
                 'det': (dx1, dy1, dx2, dy2), 'rbox': (bx1, by1, bx2, by2),
-                'tr': tr, 'src': (getattr(r, 'text', '') or ''), 'style': _style_hints(r),
-            })
+                'tr': tr, 'src': src, 'style': _style_hints(r),
+            }
+            # Where the renderer's glyph canvas actually landed — the DOM translation matches
+            # the image only when positioned at this rect, not at the layout-allowance box.
+            dr = getattr(r, '_drawn_rect', None)
+            try:
+                tx1, ty1, tx2, ty2 = (int(v) for v in dr)
+                if tx2 > tx1 and ty2 > ty1:
+                    info['tbox'] = (tx1, ty1, tx2, ty2)
+            except Exception:
+                pass
+            drawn = getattr(r, '_drawn_lines', None)
+            if isinstance(drawn, list) and any(str(s).strip() for s in drawn):
+                info['tr'] = '\n'.join(str(s) for s in drawn)
+            furi_lines = src_lines or (src.splitlines() if src.strip() else [])
+            furi = _furi_lines(furi_lines)
+            if furi:
+                info['furi'] = furi
+            infos.append(info)
         if not infos:
             return None
-
-        def _norm(x1, y1, x2, y2):
-            return {'x': x1 / W, 'y': y1 / H, 'w': (x2 - x1) / W, 'h': (y2 - y1) / H}
-
-        def _meta_bubble(info, region_xyxy):
-            dx1, dy1, dx2, dy2 = info['det']
-            bx1, by1, bx2, by2 = info['rbox']
-            return {
-                'box': _norm(dx1, dy1, dx2, dy2),
-                'rbox': _norm(bx1, by1, bx2, by2),
-                'region': _norm(*region_xyxy),
-                'tr': info['tr'], 'src': info['src'], 'style': info['style'],
-            }
 
         if mode == 'text_only':
             # Geometry/text/style only — region = union(detection box, render box), no pixels read.
@@ -1669,81 +1929,17 @@ class MangaTranslator:
             for info in infos:
                 dx1, dy1, dx2, dy2 = info['det']
                 bx1, by1, bx2, by2 = info['rbox']
-                bubbles.append(_meta_bubble(info, (min(dx1, bx1), min(dy1, by1), max(dx2, bx2), max(dy2, by2))))
+                bubbles.append(_study_meta_bubble(
+                    info, (min(dx1, bx1), min(dy1, by1), max(dx2, bx2), max(dy2, by2)), W, H))
             return {'page': {'w': W, 'h': H}, 'bubbles': bubbles}
 
         if inpainted is None or inpainted.shape[:2] != (H, W):
             return None
 
-        def _img_data_url(arr, mode_, fmt='PNG', **save_kw):
-            buf = _io.BytesIO()
-            Image.fromarray(arr, mode_).save(buf, format=fmt, **save_kw)
-            mime = 'image/webp' if fmt == 'WEBP' else 'image/png'
-            return f'data:{mime};base64,' + base64.b64encode(buf.getvalue()).decode('ascii')
-
-        def _build_page_layers():
-            """CPU-bound, one job for the whole page. EXACTNESS INVARIANT: every pixel where the
-            final render differs from the inpaint is assigned to exactly ONE bubble, whose layer
-            stores the final render's RGB at full alpha. Reassembling all bubble layers over the
-            inpaint therefore reproduces the final translated page pixel-for-pixel — nothing is
-            cropped and nothing bleeds twice. Ownership is per pixel: the render box that
-            contains it (nearest box center on overlap), else the nearest render box — so
-            adjacent bubbles split cleanly at their boundary instead of stealing each other's
-            strokes (the old component-based assignment could do both)."""
-            diff = np.abs(rendered.astype(np.int16) - inpainted.astype(np.int16)).max(axis=2)
-            changed = diff > 0
-            # Defensive: a renderer that perturbs untouched pixels (full-page roundtrip) would
-            # mark everything changed; fall back to the visible-change threshold in that case.
-            if changed.mean() > 0.35:
-                changed = diff > 8
-            ys, xs = np.nonzero(changed)
-            if xs.size == 0:
-                return None
-
-            xf = xs.astype(np.float32)
-            yf = ys.astype(np.float32)
-            best_d = np.full(xs.shape, np.inf, dtype=np.float32)
-            owner = np.zeros(xs.shape, dtype=np.int32)
-            for ri, info in enumerate(infos):
-                bx1, by1, bx2, by2 = info['rbox']
-                # squared rect-distance to the render box (0 inside) + a tiny center-distance
-                # term that deterministically breaks ties between overlapping boxes.
-                dx = np.maximum(np.maximum(bx1 - xf, 0.0), xf - (bx2 - 1))
-                dy = np.maximum(np.maximum(by1 - yf, 0.0), yf - (by2 - 1))
-                d = dx * dx + dy * dy
-                cx, cy = (bx1 + bx2) * 0.5, (by1 + by2) * 0.5
-                d += ((xf - cx) ** 2 + (yf - cy) ** 2) * np.float32(1e-7)
-                m = d < best_d
-                best_d[m] = d[m]
-                owner[m] = ri
-
-            bubbles = []
-            for ri, info in enumerate(infos):
-                sel = owner == ri
-                if not sel.any():
-                    continue
-                rx, ry = xs[sel], ys[sel]
-                gx1, gy1 = int(rx.min()), int(ry.min())
-                gx2, gy2 = int(rx.max()) + 1, int(ry.max()) + 1
-                # Full-page transparent layer holding exactly this bubble's pixels: RGB from the
-                # final render (antialiasing against the inpaint already baked in), alpha 255 so
-                # compositing over the inpaint bg reproduces the render exactly.
-                text_rgba = np.zeros((H, W, 4), dtype=np.uint8)
-                text_rgba[ry, rx, :3] = rendered[ry, rx]
-                text_rgba[ry, rx, 3] = 255
-                # bg clip region = detection box unioned with the full glyph extent.
-                dx1, dy1, dx2, dy2 = info['det']
-                bubble = _meta_bubble(info, (min(dx1, gx1), min(dy1, gy1), max(dx2, gx2), max(dy2, gy2)))
-                bubble['text'] = _img_data_url(text_rgba, 'RGBA', 'PNG')
-                bubbles.append(bubble)
-            if not bubbles:
-                return None
-            # Shared inpaint bg is opaque art (no text) → WebP is far smaller than PNG at quality
-            # the eye can't tell apart, and it only ever shows behind a revealed bubble.
-            bg = _img_data_url(inpainted, 'RGB', 'WEBP', quality=90, method=6)
-            return {'page': {'w': W, 'h': H}, 'bg': bg, 'bubbles': bubbles}
-
-        return await run_cpu(_build_page_layers)
+        # The pixel partition + per-bubble PNG/WebP encodes are CPU-heavy and GIL-holding, so run
+        # them out-of-process. The info-gathering above had to stay here (it reads region objects
+        # that don't pickle); only the two page arrays + the small `infos` list cross to the worker.
+        return await run_proc(_build_page_layers_job, rendered, inpainted, infos, W, H)
 
     def _add_logger_hook(self):
         # TODO: Pass ctx to logger hook
@@ -1998,11 +2194,15 @@ class MangaTranslator:
 
         Unlike translate_batch (strict preprocess-all → translate-all → render-all),
         the three stages overlap: pages are detected/OCR'd one by one on the GPU;
-        every `batch_size` preprocessed pages become one shared translation call that
-        runs on the network while later pages keep preprocessing; translated batches
-        are inpainted/rendered and emitted as soon as they come back. `batch_size`
-        <= 0 means all pages share a single translation call. Page entries may be
-        compressed image bytes (decoded here, one at a time) or PIL Images.
+        preprocessed pages become shared translation calls that run on the network
+        while later pages keep preprocessing; translated batches are inpainted/
+        rendered and emitted as soon as they come back. For most translators a call
+        is formed every `batch_size` pages (<= 0 means all pages share one call).
+        For DeepSeek, `batch_size` is only the MAX pages per call: request boundaries
+        adapt to the OCR output volume (token soft target, a small first request so
+        the LLM lane starts early, an idle flush that keeps a request in flight, and
+        end-of-gallery shrinking that cuts the pure network tail). Page entries may
+        be compressed image bytes (decoded here, one at a time) or PIL Images.
 
         Cross-page context (chatgpt + --context-size) is request-local: batches are
         chained in input order and the instance-global context lists are restored at
@@ -2011,22 +2211,68 @@ class MangaTranslator:
         """
         import hashlib
         import io as _io
-        import math
         from .translators import OFFLINE_TRANSLATORS
-        from .utils.profiling import snapshot_substages
+        from .utils.profiling import snapshot_substages, reset_llm_usage, snapshot_llm_usage
 
         n = len(images)
         if n == 0:
             return {"count": 0, "failed": []}
         cap = int(batch_size) if batch_size else 0
         cap = n if cap <= 0 else min(cap, n)
-        num_batches = math.ceil(n / cap)
+
+        # Adaptive LLM batching (DeepSeek): request boundaries are driven purely by OCR
+        # token volume against the model's own input-token ceiling — the frontend page
+        # count does NOT size requests. Sizing balances the two costs the pipeline trades
+        # off: round-trips (the wall bottleneck → pack toward a soft token target to send
+        # as few requests as possible) against overlap (→ a small first request and a
+        # shrinking last request so OCR/inpaint/render never stall on translation).
+        adaptive = (config.translator.translator == Translator.deepseek) and n > 1
+        soft_tokens = 0
+        if adaptive:
+            try:
+                from .translators.deepseek import DeepseekTranslator
+                # Hard ceiling = the model's real max input tokens; the prompt assembler
+                # enforces it and splits anything over, so it's the backstop, not our target.
+                # Soft target sits below it with headroom (a full request never trips the
+                # ceiling) and is small enough that several requests stay in flight across
+                # the LLM lanes instead of collapsing into one giant call that kills overlap.
+                hard_in = DeepseekTranslator._MAX_TOKENS_IN
+                soft_tokens = max(2000, min(12000, int(hard_in * 0.75)))
+            except Exception:
+                adaptive = False
+        ADAPTIVE_FIRST_PAGES = 3   # start-fast trigger only (NOT a size cap): the first request
+                                   # fires after this many pages even if still under the token
+                                   # target, so a sparse gallery still starts the pipeline promptly
+        ADAPTIVE_TAIL_PAGES = 4    # within this many pages of the end, lower the token target so
+                                   # the final request is small (cuts the pure-network tail)
+        ADAPTIVE_MAX_PAGES = cap   # HARD page ceiling per request — required for correctness, not
+                                   # just pacing. The sequencer takes one `inflight` permit per page
+                                   # BEFORE a batch flushes; a token-only batch on a sparse gallery
+                                   # (little text, target never reached) would keep accumulating and
+                                   # hold every permit, so the sequencer blocks on inflight.acquire()
+                                   # with no batch in flight to drain it → deadlock (galleries hung
+                                   # mid-run). Since inflight = max(cap*3, 8) > cap, flushing by
+                                   # cap guarantees the batch releases before it can starve inflight.
+                                   # It also keeps requests small → steady render progress, no long
+                                   # silent wait while one giant request runs. Dense pages still
+                                   # split smaller via the token target below.
+
+        def _est_page_tokens(ctx) -> int:
+            """Rough DeepSeek input-token estimate for one page's OCR text (per the DeepSeek
+            docs: ~0.6 tokens/CJK char, ~0.3/Latin char — padded, plus marker overhead)."""
+            total = 0
+            for r in (getattr(ctx, 'text_regions', None) or []):
+                t = getattr(r, 'text', '') or ''
+                cjk = sum(1 for ch in t if ord(ch) > 0x2E7F)
+                total += int(cjk * 0.7 + (len(t) - cjk) * 0.35) + 6
+            return total
 
         study_mode = str(getattr(config, 'study_mode_generation', 'disabled') or 'disabled')
         # Run-attribution header: without it a profiler summary can't be tied to a configuration
         # after the fact (translator, cap and study mode are what move the numbers).
         logger.info(
-            f'Gallery run: pages={n} batch_size={cap} translator={config.translator.translator} '
+            f'Gallery run: pages={n} batch_size={cap}{" (adaptive)" if adaptive else ""} '
+            f'translator={config.translator.translator} '
             f'target={config.translator.target_lang} renderer={config.render.renderer.value} '
             f'study_mode_generation={study_mode} job_token={(job_token[:8] + "…") if job_token else "-"}')
 
@@ -2050,6 +2296,7 @@ class MangaTranslator:
         prof = Profiler(interval=1.0)
         prof.start()
         _sub0 = snapshot_substages()          # host/kernel sub-splits reported by the models
+        reset_llm_usage()                     # per-chunk LLM request/token/cost accounting (one chunk at a time)
 
         # All CUDA runs on the single GPU worker thread (submit_gpu) → kernels serialize there, so no
         # asyncio lock is needed for GPU ordering. Per-page context is carried on ctx (ctx.image_context);
@@ -2079,14 +2326,21 @@ class MangaTranslator:
                 k: (r.text_raw if hasattr(r, 'text_raw') else r.text)
                 for k, r in enumerate(ctx.text_regions)})
 
-        async def run_batch(b_idx: int, batch: list, prev_task):
+        tl_pages_done = 0   # cumulative pages whose translation finished (for page-based progress)
+
+        async def run_batch(pages_before: int, batch: list, prev_task):
+            # gallery-tl / gallery-tl-done progress is in PAGE units (a/n), not batch
+            # indices: adaptive batching makes the batch count unknowable up front, and
+            # pages are the unit every consumer (scheduler adapter, client label/percent)
+            # actually wants. `pages_before` is the page count of all earlier batches.
+            nonlocal tl_pages_done
             try:
                 if prev_task is not None:  # context mode: keep page order across batches
                     await prev_task
                 async with llm:
                     if self._gallery_cancel:
                         raise asyncio.CancelledError()
-                    await self._report_progress(f'gallery-tl:{b_idx + 1}/{num_batches}')
+                    await self._report_progress(f'gallery-tl:{pages_before + len(batch)}/{n}')
                     pairs = [(ctx, config) for _, ctx in batch]
                     _tl_t0 = time.perf_counter()
                     if is_offline_tl:
@@ -2098,12 +2352,13 @@ class MangaTranslator:
                     self._accum_time('translation', time.perf_counter() - _tl_t0)
                 for _, ctx in batch:
                     _record_page_context(ctx)
-                await self._report_progress(f'gallery-tl-done:{b_idx + 1}/{num_batches}')
+                tl_pages_done += len(batch)
+                await self._report_progress(f'gallery-tl-done:{tl_pages_done}/{n}')
                 await post_q.put(batch)
             except asyncio.CancelledError:
                 await post_q.put([(idx, None) for idx, _ in batch])
             except Exception as e:
-                logger.error(f'Gallery batch {b_idx + 1}/{num_batches} translation failed: {e}')
+                logger.error(f'Gallery translation batch (pages {batch[0][0] + 1}-{batch[-1][0] + 1}) failed: {e}')
                 await post_q.put([(idx, None) for idx, _ in batch])
 
         async def inpaint_stage():
@@ -2133,6 +2388,17 @@ class MangaTranslator:
                         await pf
                         if ctx is not None and not self._gallery_cancel and ctx.text_regions:
                             ctx = await self._inpaint_stage(ctx, config)
+                        elif ctx is not None and not self._gallery_cancel:
+                            # Text-less page: no OCR regions, or every region was filtered as
+                            # low-value (sfx/decorative). There's nothing to translate or inpaint,
+                            # but it must still emit its ORIGINAL image — otherwise the render
+                            # worker sees result=None and marks a perfectly good art page "failed",
+                            # which also leaves it unstored so every later Translate re-runs
+                            # detection/OCR on it only to fail again. (The single-image path does
+                            # this inside _inpaint_stage; the gallery path skips that call here.)
+                            ctx.result = ctx.upscaled
+                            ctx._skip_render = True
+                            ctx = await self._revert_upscale(config, ctx)
                     except Exception as e:
                         logger.error(f'Gallery page {idx + 1} inpainting failed: {e}')
                     await render_q.put((idx, ctx))
@@ -2235,7 +2501,9 @@ class MangaTranslator:
             self._current_image_context = ic
             if self.verbose:
                 self._saved_image_contexts[md5] = dict(ic)
-            ctx = await self._translate_until_translation(img, config)
+            # ic rides on the ctx from the start: 3 pre-workers run concurrently, so the verbose
+            # stage dumps inside must never resolve through self._current_image_context.
+            ctx = await self._translate_until_translation(img, config, image_context=ic)
             ctx.image_context = dict(ic)
             ctx._gallery = True
             ctx.verbose = self.verbose
@@ -2275,6 +2543,8 @@ class MangaTranslator:
         try:
             pre_tasks = [asyncio.create_task(pre_worker()) for _ in range(PRE_WORKERS)]
             batch = []
+            batch_tokens = 0
+            pages_batched = 0
             prev_task = None
             cancelled_at = None
             for i in range(n):
@@ -2288,11 +2558,37 @@ class MangaTranslator:
                     break
                 await inflight.acquire()   # bounds pages alive between here and emit
                 batch.append((i, ctx))
-                if len(batch) >= cap or i == n - 1:
-                    task = asyncio.create_task(run_batch(len(tl_tasks), batch, prev_task if is_ctx_mode else None))
+                if adaptive:
+                    batch_tokens += _est_page_tokens(ctx)
+                    pages_left = n - (i + 1)   # gallery pages still to come after this one
+                    if i == n - 1:
+                        flush = True                        # end of gallery: flush the remainder
+                    elif not tl_tasks:
+                        # First request: fire on a fraction of the token target OR a few pages,
+                        # whichever comes first, so translation (and the inpaint/render stages
+                        # behind it) start early on both dense and sparse galleries.
+                        flush = batch_tokens >= soft_tokens // 3 or len(batch) >= ADAPTIVE_FIRST_PAGES
+                    else:
+                        # Steady state: flush at the page ceiling (correctness + steady progress),
+                        # or when the batch reaches the soft token target (dense pages split
+                        # smaller), lowering the target near the end so the final request stays
+                        # small (trims the pure-network tail). If every prior request has already
+                        # returned, the LLM lanes are idle and OCR is pacing — flush a bit early to
+                        # refill a lane, but never a trivially small request.
+                        target = (soft_tokens // 3) if pages_left <= ADAPTIVE_TAIL_PAGES else soft_tokens
+                        lanes_idle = all(t.done() for t in tl_tasks)
+                        flush = (len(batch) >= ADAPTIVE_MAX_PAGES
+                                 or batch_tokens >= target
+                                 or (lanes_idle and batch_tokens >= soft_tokens // 3))
+                else:
+                    flush = len(batch) >= cap or i == n - 1
+                if flush:
+                    task = asyncio.create_task(run_batch(pages_batched, batch, prev_task if is_ctx_mode else None))
                     tl_tasks.append(task)
                     prev_task = task
+                    pages_batched += len(batch)
                     batch = []
+                    batch_tokens = 0
             if cancelled_at is not None:
                 for idx, c in batch:
                     failed.add(idx)
@@ -2333,29 +2629,87 @@ class MangaTranslator:
             dv = v - _sub0.get(k, 0.0)
             if dv > 0.05:
                 self._stage_times[k] = dv
-        logger.info('Gallery ' + prof.summary(self._stage_times, n, emitted))
-        logger.info(
-            f'Gallery pipeline completed: {emitted}/{n} pages emitted, {len(failed_list)} failed, '
+        # This method runs once per SCHEDULER CHUNK, so these two summaries are chunk-scoped,
+        # not whole-gallery — they're logged at DEBUG to avoid masquerading as a gallery result.
+        # The single INFO-level gallery report is emitted by the job scheduler (gallery_jobs),
+        # which folds the `telemetry` below across every chunk of the same job_token.
+        # LLM request/token accounting for this chunk (empty for non-LLM translators).
+        _llm = snapshot_llm_usage()
+        llm_block = {}
+        if _llm.get('requests'):
+            from .translators.deepseek import estimate_cost_usd
+            reqs = int(_llm.get('requests', 0))
+            in_tok = int(_llm.get('prompt_tokens', 0))
+            out_tok = int(_llm.get('completion_tokens', 0))
+            hit = int(_llm.get('cache_hit', 0))
+            miss = int(_llm.get('cache_miss', 0))
+            llm_block = {
+                'requests': reqs, 'in': in_tok, 'out': out_tok,
+                'cache_hit': hit, 'cache_miss': miss,
+                'max_wall': round(float(_llm.get('max_wall', 0.0)), 1),
+                'sum_wall': round(float(_llm.get('sum_wall', 0.0)), 1),
+                'cost': round(estimate_cost_usd(hit, miss, out_tok), 4),
+            }
+
+        # This method runs once per SCHEDULER CHUNK, so these two summaries are chunk-scoped,
+        # not whole-gallery — they're logged at DEBUG to avoid masquerading as a gallery result.
+        # The single INFO-level gallery report is emitted by the job scheduler (gallery_jobs),
+        # which folds the `telemetry` below across every chunk of the same job_token.
+        logger.debug('Gallery chunk ' + prof.summary(self._stage_times, n, emitted))
+        if llm_block:
+            logger.debug(
+                f'Gallery chunk LLM: {llm_block["requests"]} requests, '
+                f'in={llm_block["in"]} (cache hit={llm_block["cache_hit"]}) out={llm_block["out"]} tok, '
+                f'slowest={llm_block["max_wall"]}s, ~${llm_block["cost"]:.4f} est')
+        logger.debug(
+            f'Gallery chunk completed: {emitted}/{n} pages emitted, {len(failed_list)} failed, '
             f'study_mode={study_mode} study_pages(meta={study_meta_pages}, image={study_image_pages}) '
             f'bubbles={bubbles_total}'
             + (' — CANCELLED (client cancel or liveness reaper)' if was_cancelled else ''))
-        return {"count": n, "failed": failed_list}
 
-    async def _translate_until_translation(self, image: Image.Image, config: Config) -> Context:
+        # Telemetry the scheduler folds into the one gallery-level summary.
+        def _avg(xs):
+            return (sum(xs) / len(xs)) if xs else 0.0
+        _wall = (time.perf_counter() - prof.t0) if prof.t0 else 0.0
+        telemetry = {
+            'wall': round(_wall, 2),
+            'emitted': emitted,
+            'failed': len(failed_list),
+            'study_meta': study_meta_pages,
+            'study_image': study_image_pages,
+            'bubbles': bubbles_total,
+            'cancelled': bool(was_cancelled),
+            'llm': llm_block,
+            'stage_times': {k: round(v, 2) for k, v in self._stage_times.items()},
+            'queue_wait': {k: round(v, 2) for k, v in prof.queue_wait.items()},
+            'gpu_avg': round(_avg(prof.gpu), 1), 'gpu_max': round(max(prof.gpu), 1) if prof.gpu else 0.0,
+            'vram_max': round(max(prof.vram_used)) if prof.vram_used else 0,
+            'vram_total': round(prof.vram_total),
+            'cpu_avg': round(_avg(prof.cpu), 1), 'cpu_max': round(max(prof.cpu), 1) if prof.cpu else 0.0,
+        }
+        return {"count": n, "failed": failed_list, "telemetry": telemetry}
+
+    async def _translate_until_translation(self, image: Image.Image, config: Config, image_context: dict = None) -> Context:
         """
         执行翻译之前的所有步骤（彩色化、上采样、检测、OCR、文本行合并）
+
+        `image_context` is this page's own debug-folder context. The gallery pipeline runs several
+        of these concurrently, so every verbose dump below must resolve its folder from the ctx,
+        never from the shared self._current_image_context.
         """
         ctx = Context()
         ctx.input = image
         ctx.result = None
-        
+        if image_context:
+            ctx.image_context = dict(image_context)
+
         # 保存原始输入图片用于调试
         if self.verbose:
             try:
                 input_img = np.array(image)
                 if len(input_img.shape) == 3:  # 彩色图片，转换BGR顺序
                     input_img = cv2.cvtColor(input_img, cv2.COLOR_RGB2BGR)
-                result_path = self._result_path('input.png')
+                result_path = self._result_path('input.png', ctx)
                 success = cv2.imwrite(result_path, input_img)
                 if not success:
                     logger.warning(f"Failed to save debug image: {result_path}")
@@ -2421,7 +2775,7 @@ class MangaTranslator:
             ctx.mask = None
 
         if self.verbose and ctx.mask_raw is not None:
-            cv2.imwrite(self._result_path('mask_raw.png'), ctx.mask_raw)
+            cv2.imwrite(self._result_path('mask_raw.png', ctx), ctx.mask_raw)
 
         if not ctx.textlines:
             await self._report_progress('skip-no-regions', True)
@@ -2432,16 +2786,16 @@ class MangaTranslator:
             img_bbox_raw = np.copy(ctx.img_rgb)
             for txtln in ctx.textlines:
                 cv2.polylines(img_bbox_raw, [txtln.pts], True, color=(255, 0, 0), thickness=2)
-            cv2.imwrite(self._result_path('bboxes_unfiltered.png'), cv2.cvtColor(img_bbox_raw, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(self._result_path('bboxes_unfiltered.png', ctx), cv2.cvtColor(img_bbox_raw, cv2.COLOR_RGB2BGR))
 
         # -- OCR
         await self._report_progress('ocr')
         try:
             ctx.textlines = await self._run_ocr(config, ctx)
-        except Exception as e:  
-            logger.error(f"Error during ocr:\n{traceback.format_exc()}")  
-            if not self.ignore_errors:  
-                raise 
+        except Exception as e:
+            logger.error(f"Error during ocr:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
             ctx.textlines = []
 
         if not ctx.textlines:
@@ -2461,15 +2815,15 @@ class MangaTranslator:
 
         if self.verbose and ctx.text_regions:
             show_panels = not config.force_simple_sort  # 当不使用简单排序时显示panel
-            bboxes = visualize_textblocks(cv2.cvtColor(ctx.img_rgb, cv2.COLOR_BGR2RGB), ctx.text_regions, 
+            bboxes = visualize_textblocks(cv2.cvtColor(ctx.img_rgb, cv2.COLOR_BGR2RGB), ctx.text_regions,
                                         show_panels=show_panels, img_rgb=ctx.img_rgb, right_to_left=config.render.rtl)
-            cv2.imwrite(self._result_path('bboxes.png'), bboxes)
+            cv2.imwrite(self._result_path('bboxes.png', ctx), bboxes)
 
         # Apply pre-dictionary after textline merge
         pre_dict = load_dictionary(self.pre_dict)
         pre_replacements = []
         for region in ctx.text_regions:
-            original = region.text  
+            original = region.text
             region.text = apply_dictionary(region.text, pre_dict)
             if original != region.text:
                 pre_replacements.append(f"{original} => {region.text}")
@@ -2482,7 +2836,9 @@ class MangaTranslator:
             logger.info("No pre-translation replacements made.")
 
         # 保存当前图片上下文到ctx中，用于并发翻译时的路径管理
-        if self._current_image_context:
+        # (only as a fallback — never overwrite the per-page context set at ctx creation,
+        # self._current_image_context may belong to a different in-flight page by now)
+        if self._current_image_context and not getattr(ctx, 'image_context', None):
             ctx.image_context = self._current_image_context.copy()
 
         return ctx
@@ -3212,13 +3568,13 @@ class MangaTranslator:
                                                               self.device, self.verbose)
                 
                 # 保存inpaint_input.png
-                inpaint_input_path = self._result_path('inpaint_input.png')
+                inpaint_input_path = self._result_path('inpaint_input.png', ctx)
                 success1 = cv2.imwrite(inpaint_input_path, cv2.cvtColor(inpaint_input_img, cv2.COLOR_RGB2BGR))
                 if not success1:
                     logger.warning(f"Failed to save debug image: {inpaint_input_path}")
-                
+
                 # 保存mask_final.png
-                mask_final_path = self._result_path('mask_final.png')
+                mask_final_path = self._result_path('mask_final.png', ctx)
                 success2 = cv2.imwrite(mask_final_path, ctx.mask)
                 if not success2:
                     logger.warning(f"Failed to save debug image: {mask_final_path}")
@@ -3246,7 +3602,7 @@ class MangaTranslator:
 
         if self.verbose:
             try:
-                inpainted_path = self._result_path('inpainted.png')
+                inpainted_path = self._result_path('inpainted.png', ctx)
                 success = cv2.imwrite(inpainted_path, cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR))
                 if not success:
                     logger.warning(f"Failed to save debug image: {inpainted_path}")
@@ -3283,7 +3639,7 @@ class MangaTranslator:
 
         # 保存debug文件夹信息到Context中（用于Web模式的缓存访问）
         if self.verbose:
-            ctx.debug_folder = self._get_image_subfolder()
+            ctx.debug_folder = ic['subfolder'] if ic else ''
 
         return await self._revert_upscale(config, ctx)
     

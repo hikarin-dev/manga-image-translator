@@ -60,6 +60,8 @@ class Renderer(str, Enum):
     default = "default"
     manga2Eng = "manga2eng"
     manga2EngPillow = "manga2eng_pillow"
+    shiori = "shiori"
+    shioriV2 = "shiori_v2"
     none = "none"
 
 class Alignment(str, Enum):
@@ -88,6 +90,7 @@ class Detector(str, Enum):
     craft = "craft"
     paddle = "paddle"
     none = "none"
+    oneocr = "oneocr"
 
 class Inpainter(str, Enum):
     default = "default"
@@ -104,8 +107,12 @@ class Colorizer(str, Enum):
 class Ocr(str, Enum):
     ocr32px = "32px"
     ocr48px = "48px"
+    ocr48px_exp = "48px_exp"
     ocr48px_ctc = "48px_ctc"
     mocr = "mocr"
+    mocr_fast = "mocr_fast"
+    mocr_tflite = "mocr_tflite"
+    oneocr = "oneocr"
 
 class Translator(str, Enum):
     youdao = "youdao"
@@ -174,6 +181,10 @@ class RenderConfig(BaseModel):
     """If renderer should be splitting up words using a hyphen character (-)"""
     font_color: Optional[str] = None
     """Overwrite the text fg/bg color detected by the OCR model. Use hex string without the "#" such as FFFFFF for a white foreground or FFFFFF:000000 to also have a black background around the text."""
+    estimate_font_color: bool = False
+    """Replace the OCR model's text fill color with a page-consistent estimate taken from the image"""
+    estimate_outline_color: bool = False
+    """Replace the text outline color with a page-consistent estimate from the glyph edge or its immediate surroundings"""
     line_spacing: Optional[int] = None
     """Line spacing is font_size * this value. Default is 0.01 for horizontal text and 0.2 for vertical."""
     font_size: Optional[int] = None

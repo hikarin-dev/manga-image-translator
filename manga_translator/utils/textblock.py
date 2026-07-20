@@ -355,14 +355,39 @@ class TextBlock(object):
         frgb = np.array(self.fg_colors).astype(np.int32)
         brgb = np.array(self.bg_colors).astype(np.int32)
 
+        # Color correction: equivalent of CSS `filter: saturate(147%)` — scale each channel
+        # away from the Rec.709 luma (the browser filter matrix), clamped to [0, 255].
+        s = 1.47
+        for c in (frgb, brgb):
+            luma = 0.213 * c[0] + 0.715 * c[1] + 0.072 * c[2]
+            c[:] = np.clip(np.rint(luma + (c - luma) * s), 0, 255).astype(np.int32)
+
         if bgr:
             frgb = frgb[::-1]
             brgb = brgb[::-1]
 
         if self.adjust_bg_color:
-            fg_avg = np.mean(frgb)
-            if color_difference(frgb, brgb) < 30:
-                brgb = (255, 255, 255) if fg_avg <= 127 else (0, 0, 0)
+            # --- original: snap a low-contrast outline to black or white by fill luminance ---
+            # fg_avg = np.mean(frgb)
+            # if color_difference(frgb, brgb) < 30:
+            #     brgb = (255, 255, 255) if fg_avg <= 127 else (0, 0, 0)
+            # --- override: when the outline is too close to the fill to be a real outline,
+            #     match it to the clean (inpainted) bubble background so a spurious outline
+            #     blends in — light bubble -> white, dark bubble -> black (a dark bubble with a
+            #     dark fill falls back to white to keep the text legible). Without a bubble
+            #     sample, fall back to a contrasting halo by fill luminance.
+            #     (revert by restoring the block above)
+            if color_difference(frgb, brgb) < 70:
+                bubble_bg = getattr(self, '_bubble_bg', None)
+                if bubble_bg is not None:
+                    if np.mean(bubble_bg) > 60:       # light bubble (> ~50/255)
+                        brgb = (255, 255, 255)
+                    elif np.mean(frgb) > 127:         # dark bubble, light fill
+                        brgb = (0, 0, 0)
+                    else:                             # dark bubble, dark fill
+                        brgb = (255, 255, 255)
+                else:
+                    brgb = (255, 255, 255) if np.mean(frgb) <= 127 else (0, 0, 0)
 
         return frgb, brgb
 
