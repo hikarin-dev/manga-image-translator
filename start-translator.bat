@@ -20,7 +20,7 @@ echo.
 REM No --verbose: that flag saves every intermediate step image + final.png into result\,
 REM which balloons disk. The streaming API returns the image directly and saves nothing.
 REM --models-ttl 300: unload models from VRAM after 5 minutes idle (frees GPU for gaming).
-"%~dp0.venv\Scripts\python.exe" server\main.py --host 127.0.0.1 --port 5003 --use-gpu --context-size 4 --models-ttl 300
+"%~dp0venv\Scripts\python.exe" server\main.py --host 127.0.0.1 --port 5003 --use-gpu --context-size 4 --models-ttl 300 --verbose
 echo.
 echo Server stopped. Press any key to close.
 pause >nul
