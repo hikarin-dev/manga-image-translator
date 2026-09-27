@@ -158,7 +158,9 @@ Aux joining is off entirely while this is unset. Restart the server, then confir
 ### On each aux machine
 
 Install it like the main server (README, "Install from scratch"), at the same commit so its
-stage builds match. Edit `run-aux-node.bat` to set `MT_AUX_JOIN` (your
+stage builds match. Give it its own `.env` with the same translator keys as the main server
+(for example `DEEPSEEK_API_KEY`): a node translates the pages it takes, and keys never travel
+from the main server. Edit `run-aux-node.bat` to set `MT_AUX_JOIN` (your
 `https://translate.YOURDOMAIN.com`) and `MT_AUX_TOKEN`, then run it. That's the whole setup —
 repeat verbatim for every extra machine. Equivalent by hand:
 
