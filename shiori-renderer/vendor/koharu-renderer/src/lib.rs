@@ -1,9 +1,28 @@
-pub mod font;
-pub mod layout;
-pub mod renderer;
-pub mod segment;
-pub mod shape;
-pub mod text;
-pub mod types;
+//! Retained rendering of one semantic Koharu page.
 
-pub use types::{RenderBlock, TextAlign, TextDirection, TextShaderEffect};
+mod bubble;
+mod config;
+mod error;
+mod fonts;
+mod frame;
+mod images;
+mod layout;
+mod renderer;
+mod script;
+mod segment;
+mod shape;
+mod text_renderer;
+mod types;
+
+pub use config::TypesettingConfig;
+pub use error::{Error, Result};
+pub use frame::{
+    Frame, ImageKind, ImageMetadata, Layer, LayerKind, Presentation, RasterImage, RenderBounds,
+    RenderDependency, RenderDiagnostic, RetentionStats, TextMetadata,
+};
+pub use frame::{SnapshotFont, SnapshotLine, TextSnapshot};
+pub use layout::WritingMode;
+pub use renderer::Renderer;
+pub use types::{FontFace, FontFamily, FontMetadata, FontRange, FontSource, FontStyle, TextAlign};
+
+pub(crate) use layout::{HyphenationPolicy, LayoutRun, TextLayout};

@@ -166,6 +166,7 @@
     <h1>Shiori translation server</h1>
     <span class="sub" id="uptime">—</span>
     <span class="spacer"></span>
+    <!-- operator-feedback-link -->
     <span class="sub state"><span class="dot idle" id="livedot"></span><span id="live">connecting…</span></span>
   </header>
 
@@ -309,8 +310,9 @@ function renderJobs(list, full) {
     .map(c => `<th class="${numeric.has(c) ? 'num' : ''}">${esc(c)}</th>`).join('');
 
   $('jobs').innerHTML = jobs.map((j, i) => {
-    const cls = j.cancelled ? 'idle' : (j.failed ? 'warn' : 'good');
-    const word = j.cancelled ? 'Cancelled' : (j.failed ? 'Partial' : 'Complete');
+    const incomplete = j.emitted != null && j.emitted < j.pages;
+    const cls = j.cancelled ? 'idle' : (j.failed || incomplete ? 'warn' : 'good');
+    const word = j.cancelled ? 'Cancelled' : (j.failed ? 'Partial' : (incomplete ? 'Incomplete' : 'Complete'));
     const spp = j.sec_per_page ?? (j.pages ? j.wall_s / j.pages : 0);
     const src = j.source_url
       ? `<a href="${esc(j.source_url)}" target="_blank" rel="noopener noreferrer">${esc(host(j.source_url))}</a>`
@@ -359,22 +361,25 @@ function openDetail(j) {
         ? `<span class="mono">${esc(j.key)}</span>`
         : '<span class="sub">none (unauthenticated)</span>'],
       ['Job token', `<span class="mono">${esc(j.token || '')}</span>`],
+      ['Renderer', esc(j.renderer || 'not recorded')],
       ['Source', j.source_url
         ? `<a href="${esc(j.source_url)}" target="_blank" rel="noopener noreferrer">${esc(j.source_url)}</a>`
         : '<span class="sub">not supplied</span>'],
-      ['Outcome', j.cancelled ? 'Cancelled' : (j.failed ? `Partial — ${j.failed} page(s) failed` : 'Complete')],
+      ['Outcome', j.cancelled ? 'Cancelled' : (j.failed ? `Partial — ${j.failed} page(s) failed` : (j.emitted != null && j.emitted < j.pages ? 'Incomplete' : 'Complete'))],
     ])}</section>
     <section><h4>Throughput</h4>${kv([
       ['Pages', `${j.emitted ?? 0} of ${j.pages ?? 0} delivered`],
       ['Wall time', dur(j.wall_s)],
       ['Seconds per page', spp ? spp.toFixed(2) + 's' : '—'],
-      ['On-GPU compute', dur(j.compute_s)],
+      ['Worker chunk time', dur(j.compute_s)],
       ['Chunks', j.chunks ?? '—'],
       ['Peak GPU', j.gpu_max_pct ? j.gpu_max_pct + '%' : '—'],
       ['Peak VRAM', j.vram_max_mb ? (j.vram_max_mb / 1024).toFixed(1) + ' GB' : '—'],
     ])}</section>
     <section><h4>Pipeline stages</h4>${rows(j.stages_s)}</section>
     <section><h4>Queue waits</h4>${rows(j.waits_s)}</section>
+    ${Object.values(j.reuse || {}).some(c => c.reused) ? `<section><h4>Stage reuse</h4>${kv(
+      Object.entries(j.reuse).map(([stage, c]) => [stage, `${c.reused} reused · ${c.ran} ran`]))}</section>` : ''}
     ${j.llm_requests ? `<section><h4>LLM</h4>${kv([
       ['Requests', j.llm_requests],
       ['Tokens in / out', `${j.llm_in ?? 0} / ${j.llm_out ?? 0}`],

@@ -30,6 +30,20 @@ def _roll() -> None:
                      'compute_s': 0.0, 'llm_cost_usd': 0.0}
 
 
+def _mem_entry(chunks: list) -> dict:
+    """Worker memory over the job (GB): peaks across chunks plus each chunk's commit at start,
+    end and peak, so growth over a long job shows up as a rising start/end series."""
+    if not chunks:
+        return {}
+    peak = lambda k: max((c.get(k) or 0) for c in chunks)
+    return {'commit_max': peak('commit_max'), 'rss_max': peak('rss_max'),
+            'children_max': peak('children_max'), 'threads_max': peak('threads_max'),
+            # PyTorch's VRAM: what it kept vs what the models needed at most (also charged as commit).
+            'cuda_reserved_max': peak('cuda_reserved_max'), 'cuda_allocated_max': peak('cuda_allocated_max'),
+            'chunks': [[c.get('commit_start'), c.get('commit_end'), c.get('commit_max'), c.get('cuda_reserved')]
+                       for c in chunks]}
+
+
 def record_job(sj, cancelled: bool = False) -> None:
     """Fold one finished (or cancelled) gallery job into the day counters and jobs.jsonl.
     `sj` is a gallery_jobs._SchedJob — its tel_* fields are already summed across chunks."""
@@ -44,6 +58,7 @@ def record_job(sj, cancelled: bool = False) -> None:
         # here — the server only stores and displays it.
         'source_url': getattr(sj, 'source_url', ''),
         'pages': sj.total,
+        'renderer': getattr(getattr(getattr(sj, 'config', None), 'render', None), 'renderer', None),
         'emitted': sj.tel_emitted,
         'failed': len(set(sj.failed)),
         'cancelled': bool(cancelled or sj.tel_cancelled),
@@ -59,6 +74,12 @@ def record_job(sj, cancelled: bool = False) -> None:
         'llm_requests': sj.tel_llm_requests,
         'llm_in': sj.tel_llm_in,
         'llm_out': sj.tel_llm_out,
+        # Stage reuse per stage: how many pages restored it vs ran it.
+        'reuse': getattr(sj, 'tel_reuse', {}),
+        'settings': sj.settings() if hasattr(sj, 'settings') else {},
+        'pages_mp': getattr(sj, 'page_mp', {}),
+        'first_page_s': getattr(sj, 'first_page_s', None),
+        'mem': _mem_entry(getattr(sj, 'tel_mem', [])),
     }
     _counters['jobs'] += 1
     if entry['cancelled']:

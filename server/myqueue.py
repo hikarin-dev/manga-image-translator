@@ -72,11 +72,16 @@ class GalleryQueueElement:
     job_token: str
     cancelled: bool
 
-    def __init__(self, req: Request, images: List, config: Config, batch_size: int = 0, job_token: str = "", parent=None):
+    def __init__(self, req: Request, images: List, config: Config, batch_size: int = 0, job_token: str = "", parent=None,
+                 pages: List = None, builds: str = None, context: List = None, capture: bool = True):
         self.req = req
         self.images = images
         self.config = config
         self.batch_size = batch_size
+        self.pages = pages               # per-page pipeline data from the client (see manga_translator.page_data)
+        self.builds = builds             # stage-build signature the client planned against
+        self.context = context           # earlier pages a context-aware translator starts from
+        self.capture = capture           # False: the client wants no pipeline data back
         self.job_token = job_token       # client-issued id; lets /translate/gallery/cancel target this job
         self.cancelled = False           # set by an explicit cancel for a still-queued job
         self.parent = parent             # the scheduler's _SchedJob, when this chunk belongs to one
@@ -172,6 +177,7 @@ async def wait_in_queue(task: QueueElement | BatchQueueElement, notify: NotifyTy
                     raise HTTPException(500, detail="User is no longer connected") #just for the logs
 
             instance = await executor_instances.find_executor(gallery)
+            task.instance = instance        # gallery_jobs reports this chunk's reading done to it
             await task_queue.remove(task)
             if notify:
                 notify(4, b"")
@@ -186,8 +192,13 @@ async def wait_in_queue(task: QueueElement | BatchQueueElement, notify: NotifyTy
                         running_galleries.setdefault(task.job_token, []).append(instance)
                     cancel_sent = False
                     try:
+                        reuse = {k: v for k, v in (('pages', task.pages), ('builds', task.builds),
+                                                   ('context', task.context)) if v}
+                        if not task.capture:
+                            reuse['capture'] = False
                         stream_task = asyncio.create_task(
-                            instance.sent_gallery_stream(task.images, task.config, notify, task.batch_size, task.job_token))
+                            instance.sent_gallery_stream(task.images, task.config, notify, task.batch_size, task.job_token,
+                                                         **reuse))
                         while True:
                             done, _ = await asyncio.wait({stream_task}, timeout=2.0)
                             if done:
@@ -237,7 +248,7 @@ async def wait_in_queue(task: QueueElement | BatchQueueElement, notify: NotifyTy
                     else:
                         result = await instance.sent(task.image, task.config)
 
-                await executor_instances.free_executor(instance)
+                await executor_instances.free_executor(instance, getattr(task, 'read_done', False))
 
                 if notify:
                     return
@@ -246,7 +257,7 @@ async def wait_in_queue(task: QueueElement | BatchQueueElement, notify: NotifyTy
 
             except Exception as e:
                 # 确保实例被释放
-                await executor_instances.free_executor(instance)
+                await executor_instances.free_executor(instance, getattr(task, 'read_done', False))
 
                 # 如果是连接错误，发送友好的错误消息
                 if "Cannot connect to host" in str(e) or "Connection refused" in str(e):

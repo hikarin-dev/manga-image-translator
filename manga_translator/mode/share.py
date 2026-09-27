@@ -1,8 +1,11 @@
 import asyncio
+import contextvars
+import os
 import pickle
 import io
 import json
 import secrets
+import threading
 from threading import Lock
 
 import uvicorn
@@ -11,8 +14,18 @@ from pydantic import BaseModel
 
 from starlette.responses import StreamingResponse
 
-from manga_translator import MangaTranslator
+from manga_translator import MangaTranslator, stages
+from manga_translator.manga_translator import STUDY_LAYERS
 from manga_translator.utils.executors import run_cpu
+
+# The frame queue of the request being served. Every hook call happens inside the task that runs the
+# request's method (or a task it started), so frames reach that request's own stream even when
+# several gallery runs are in flight.
+_STREAM: contextvars.ContextVar = contextvars.ContextVar('stream_queue', default=None)
+# Gallery runs one worker serves at once. The main server hands a worker a second chunk only once
+# the first has read every page, so the second one's reading overlaps the first one's tail instead
+# of the GPU idling through a drain between chunks.
+GALLERY_RUNS = int(os.environ.get('MT_WORKER_GALLERY_RUNS', '2'))
 
 SAFE_PICKLE_MODULES = frozenset({
     'builtins',
@@ -61,12 +74,13 @@ class MangaShare:
         # each chunk has a structure like this status_code(int/1byte),len(int/4bytes),bytechunk
         # status codes are 0 for result, 1 for progress report, 2 for error
         self.progress_queue = asyncio.Queue()
-        self.lock = Lock()
+        self.lock = Lock()          # held by a method that must run alone
+        self.galleries = 0          # gallery runs in flight (up to GALLERY_RUNS)
 
         async def hook(state: str, finished: bool):
             state_data = state.encode("utf-8")
             progress_data = b'\x01' + len(state_data).to_bytes(4, 'big') + state_data
-            await self.progress_queue.put(progress_data)
+            await self._queue().put(progress_data)
             await asyncio.sleep(0)
 
         self.manga.add_progress_hook(hook)
@@ -78,6 +92,13 @@ class MangaShare:
         # queue isolation. Lets the client render pages as they complete.
         async def page_result_hook(index: int, image):
             if image is None:
+                return
+            # A page whose study data (status 6, next) stands in for it carries no image.
+            if image == STUDY_LAYERS:
+                token = (getattr(self.manga, '_gallery_job_token', '') or '').encode('utf-8')[:255]
+                data = bytes([len(token)]) + token + index.to_bytes(4, 'big')
+                await self._queue().put(b'\x05' + len(data).to_bytes(4, 'big') + data)
+                await asyncio.sleep(0)
                 return
             # Encode the finished page as WebP — a translated manga page is a fraction of the
             # PNG size at quality the eye can't tell from lossless (the source pages are WebP
@@ -97,10 +118,23 @@ class MangaShare:
             token = (getattr(self.manga, '_gallery_job_token', '') or '').encode('utf-8')[:255]
             data = bytes([len(token)]) + token + index.to_bytes(4, 'big') + png
             frame = b'\x05' + len(data).to_bytes(4, 'big') + data
-            await self.progress_queue.put(frame)
+            await self._queue().put(frame)
             await asyncio.sleep(0)
 
         self.manga.add_page_result_hook(page_result_hook)
+
+        # status 9 = one page's pipeline data (manga_translator.page_data container), sent just
+        # before the page's status-5 frame. Same envelope: tokenLen(1) + job_token + page-index
+        # (4 BE) + container. The client keeps it so a later run of the page can skip stages.
+        async def page_data_hook(index: int, container: bytes):
+            token = (getattr(self.manga, '_gallery_job_token', '') or '').encode('utf-8')[:255]
+            data = bytes([len(token)]) + token + index.to_bytes(4, 'big') + container
+            await self._queue().put(b'\x09' + len(data).to_bytes(4, 'big') + data)
+            await asyncio.sleep(0)
+
+        self.manga.add_page_data_hook(page_data_hook)
+        # Stage builds must describe the code loaded now, not files edited later.
+        threading.Thread(target=stages.warm, name='stage-builds', daemon=True).start()
 
         # status 6 = one page's study layers. Same envelope as status 5: data = tokenLen(1) +
         # job_token + page-index (4 BE) + JSON bytes, where the JSON is {bg, bubbles}: bg is a
@@ -114,7 +148,7 @@ class MangaShare:
             token = (getattr(self.manga, '_gallery_job_token', '') or '').encode('utf-8')[:255]
             data = bytes([len(token)]) + token + index.to_bytes(4, 'big') + payload
             frame = b'\x06' + len(data).to_bytes(4, 'big') + data
-            await self.progress_queue.put(frame)
+            await self._queue().put(frame)
             await asyncio.sleep(0)
 
         self.manga.add_page_bubbles_hook(page_bubbles_hook)
@@ -134,7 +168,9 @@ class MangaShare:
             if progress[0] == 0 or progress[0] == 2:
                 break
 
-    async def run_method(self, method, **attributes):
+    async def run_method(self, method, q=None, gallery=False, **attributes):
+        if q is not None:
+            _STREAM.set(q)
         try:
             if asyncio.iscoroutinefunction(method):
                 result = await method(**attributes)
@@ -154,13 +190,13 @@ class MangaShare:
                 result_bytes = pickle.dumps(result)
 
             encoded_result = b'\x00' + len(result_bytes).to_bytes(4, 'big') + result_bytes
-            await self.progress_queue.put(encoded_result)
+            await self._queue().put(encoded_result)
         except Exception as e:
             err_bytes = str(e).encode("utf-8")
             encoded_result = b'\x02' + len(err_bytes).to_bytes(4, 'big') + err_bytes
-            await self.progress_queue.put(encoded_result)
+            await self._queue().put(encoded_result)
         finally:
-            self.lock.release()
+            self.release(gallery)
 
 
     def check_nonce(self, request: Request):
@@ -169,9 +205,23 @@ class MangaShare:
             if nonce != self.nonce:
                 raise HTTPException(401, detail="Nonce does not match")
 
+    def _queue(self) -> asyncio.Queue:
+        return _STREAM.get() or self.progress_queue
+
     def check_lock(self):
-        if not self.lock.acquire(blocking=False):
+        if self.galleries or not self.lock.acquire(blocking=False):
             raise HTTPException(status_code=429, detail="some Method is already being executed.")
+
+    def check_gallery_slot(self):
+        if self.lock.locked() or self.galleries >= GALLERY_RUNS:
+            raise HTTPException(status_code=429, detail="no free gallery slot on this worker.")
+        self.galleries += 1
+
+    def release(self, gallery: bool):
+        if gallery:
+            self.galleries -= 1
+        else:
+            self.lock.release()
 
     def get_fn(self, method_name: str):
         if method_name.startswith("__"):
@@ -188,7 +238,7 @@ class MangaShare:
 
         @app.get("/is_locked")
         async def is_locked():
-            if self.lock.locked():
+            if self.lock.locked() or self.galleries:
                 return {"locked": True}
             return {"locked": False}
 
@@ -201,11 +251,7 @@ class MangaShare:
             when no token is given, the legacy "cancel whatever is running"). This stops a
             late cancel from killing a *different* gallery that started in the meantime."""
             self.check_nonce(request)
-            running = getattr(self.manga, '_gallery_job_token', '') or ''
-            if not job_token or job_token == running:
-                self.manga._gallery_cancel = True
-                return {"cancelling": self.lock.locked()}
-            return {"cancelling": False}
+            return {"cancelling": self.manga.cancel_gallery(job_token)}
 
         @app.post("/simple_execute/{method_name}")
         async def execute_method(request: Request, method_name: str = Path(...)):
@@ -228,24 +274,29 @@ class MangaShare:
         @app.post("/execute/{method_name}")
         async def execute_method(request: Request, method_name: str = Path(...)):
             self.check_nonce(request)
-            self.check_lock()
-            method = self.get_fn(method_name)
-            attr = restricted_loads(await request.body())
+            gallery = method_name == 'translate_gallery_stream'
+            self.check_gallery_slot() if gallery else self.check_lock()
+            try:
+                method = self.get_fn(method_name)
+                attr = restricted_loads(await request.body())
+            except BaseException:
+                self.release(gallery)
+                raise
 
             # 根据端点类型决定是否使用占位符优化
             config = attr.get('config')
             self.manga._is_streaming_mode = getattr(config, '_web_frontend_optimized', False) if config else False
 
-            # Fresh queue per job (check_lock serialises jobs, so the hooks — which push to
-            # self.progress_queue — always target the active job's queue). The stream reads
-            # this exact `q`, so a dead/aborted job's leftover frames can't bleed into the
-            # next job's response. This is the structural guard against cross-gallery mix-up.
+            # Fresh queue per job, bound to the task that runs it (see _STREAM): the hooks push to
+            # this request's queue and the stream reads this exact `q`, so neither a dead job's
+            # leftover frames nor a run alongside can bleed into this response. This is the
+            # structural guard against cross-gallery mix-up.
             q = asyncio.Queue()
             self.progress_queue = q
 
             # streaming response
             streaming_response = StreamingResponse(self.progress_stream(q), media_type="application/octet-stream")
-            asyncio.create_task(self.run_method(method, **attr))
+            asyncio.create_task(self.run_method(method, q, gallery, **attr))
             return streaming_response
 
         return app

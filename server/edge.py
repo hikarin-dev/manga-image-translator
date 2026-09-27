@@ -103,9 +103,17 @@ MAX_LIVE_JOBS = int(os.getenv('MT_MAX_LIVE_JOBS', '8'))
 # /results*, /result static files, /queue-size, /reset-context, /docs, the legacy
 # translate endpoints — stays local-only.
 PUBLIC_PATHS = {
+    '/benchmark/info',
+    '/benchmark/gallery/start',
+    '/benchmark/gallery/poll',
+    '/benchmark/gallery/cancel',
+    '/feedback/save',
+    '/feedback/export',
     '/translate/gallery/start',
     '/translate/gallery/poll',
     '/translate/gallery/cancel',
+    '/translate/gallery/resolve',
+    '/capabilities',
     '/stats',
 }
 _LOOPBACK = {'127.0.0.1', '::1', 'localhost'}
@@ -162,6 +170,12 @@ def dashboard_allowed(ip: str) -> bool:
         return False
 
 
+def feedback_operator(request) -> bool:
+    # Review content is private to the operator; connected workers do not inherit access.
+    return (not getattr(request.state, 'external', True)
+            or _in_nets(getattr(request.state, 'client_ip', ''), DASHBOARD_NETS))
+
+
 class EdgeGate:
     """Pure ASGI middleware (BaseHTTPMiddleware buffers streaming responses; this doesn't).
     Must sit INSIDE CORSMiddleware so its rejections still get CORS headers — i.e. add it
@@ -190,6 +204,10 @@ class EdgeGate:
                 # web UI (whose endpoints are blocked out here anyway) to the internet.
                 return await self._respond(send, 200, b'Shiori translation server is running.\n',
                                            content_type=b'text/plain; charset=utf-8')
+            if path == '/dashboard/feedback' or path.startswith('/dashboard/feedback/'):
+                if not _in_nets(state['client_ip'], DASHBOARD_NETS):
+                    return await self._reject(send, 404, 'Not found')
+                return await self.app(scope, receive, send)
             if path in DASHBOARD_PATHS:
                 # 404, not 403: a caller who isn't allowlisted learns nothing about the page
                 # existing. Allowlisted callers skip the access token — a browser cannot send

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import stat
 import sys
@@ -6,6 +7,7 @@ import re
 import torch
 import shutil
 import filecmp
+import time
 from abc import ABC, abstractmethod
 from functools import cached_property
 
@@ -18,6 +20,7 @@ from .generic import (
     get_filename_from_url,
 )
 from .executors import submit_gpu
+from .profiling import record_model_load
 from .log import get_logger
 from ..config import TranslatorConfig
 
@@ -332,11 +335,22 @@ class ModelWrapper(ABC):
         '''
         if not self.is_downloaded():
             await self.download()
-        if not self.is_loaded():
+        if self.is_loaded():
+            return
+        # Concurrent pages all find the model unloaded while its first load is still running;
+        # without this they each load it again (the benchmark saw OCR loaded twice in one warm-up).
+        # One lock per event loop: asyncio locks can't be shared across loops.
+        locks = self.__dict__.setdefault('_load_locks', {})
+        lock = locks.setdefault(id(asyncio.get_running_loop()), asyncio.Lock())
+        async with lock:
+            if self.is_loaded():
+                return
             # Allocate/move the model on its GPU lane so every CUDA op of this model —
             # load and inference alike — shares that one thread.
+            load_started = time.perf_counter()
             await submit_gpu(self._load(*args, **kwargs, device=device), self._GPU_LANE)
             self._loaded = True
+            record_model_load(self._key, load_started, time.perf_counter() - load_started)
 
     async def unload(self):
         if self.is_loaded():

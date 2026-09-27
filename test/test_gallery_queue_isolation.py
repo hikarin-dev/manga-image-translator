@@ -27,12 +27,16 @@ class _StubManga:
         self._gallery_cancel = False
         self._gallery_job_token = ''
         self._is_streaming_mode = False
+        self._gallery_runs = {}
+    cancel_gallery = share_mod.MangaTranslator.cancel_gallery
     def add_progress_hook(self, hook):
         self._progress_hook = hook
     def add_page_result_hook(self, hook):
         self._page_result_hook = hook
     def add_page_bubbles_hook(self, hook):
         self._page_bubbles_hook = hook
+    def add_page_data_hook(self, hook):
+        self._page_data_hook = hook
 
 
 @pytest.fixture
@@ -102,25 +106,28 @@ def test_page_frame_carries_token(share):
 
 
 def test_worker_cancel_is_token_scoped(share):
-    """/cancel_gallery only aborts when the token matches the running job (or is omitted)."""
+    """/cancel_gallery aborts only the run(s) whose token matches (or every run when omitted), so a
+    late cancel can't kill a different gallery, including one running alongside on this worker."""
     from fastapi.testclient import TestClient
+    from manga_translator.manga_translator import GalleryRun
     client = TestClient(share.build_app())
-    share.manga._gallery_job_token = 'RUNNING'
+    running, other = GalleryRun('RUNNING', None), GalleryRun('OTHER', None)
+    share.manga._gallery_runs = {'RUNNING': [running], 'OTHER': [other]}
 
     # Wrong token → must NOT cancel (this is the bug that mixed galleries up).
-    share.manga._gallery_cancel = False
     r = client.post('/cancel_gallery', data={'job_token': 'SOMEONE-ELSE'})
     assert r.json()['cancelling'] is False
-    assert share.manga._gallery_cancel is False
+    assert not running.cancel and not other.cancel
 
-    # Matching token → cancels.
+    # Matching token → cancels that run only.
     r = client.post('/cancel_gallery', data={'job_token': 'RUNNING'})
-    assert share.manga._gallery_cancel is True
+    assert r.json()['cancelling'] is True
+    assert running.cancel and not other.cancel
 
-    # Omitted token (the cancel backstop) → legacy "cancel whatever is running".
-    share.manga._gallery_cancel = False
+    # Omitted token (the cancel backstop) → every run.
+    running.cancel = False
     r = client.post('/cancel_gallery', data={'job_token': ''})
-    assert share.manga._gallery_cancel is True
+    assert running.cancel and other.cancel
 
 
 def test_queued_gallery_cancel_drops_before_dispatch():
@@ -187,6 +194,29 @@ def test_gallery_job_poll_cursor():
     meta3, pages3, term3 = parse(job.poll(2))
     assert meta3['cursor'] == 3 and meta3['status'] == 'done' and meta3['done'] == 3
     assert pages3 == 1 and term3, 'poll returns the new page + the terminal summary'
+
+
+def test_gallery_job_frees_acknowledged_frames():
+    """Polling from a cursor acknowledges everything before it, so a long job doesn't keep every
+    finished page in the main process; frames past the cursor stay until they are collected."""
+    import server.gallery_jobs as gj
+
+    def page(i):
+        body = bytes([3]) + b'tok' + i.to_bytes(4, 'big') + b'img'
+        return bytes([5]) + len(body).to_bytes(4, 'big') + body
+
+    job = gj.GalleryJob('tok'); job.total = 4
+    for i in range(3):
+        job.put_nowait(page(i))
+    job.poll(0)
+    assert len(job.durable) == 3, 'nothing is freed until the client asks past it'
+    job.poll(2)
+    assert job.base == 2 and job.durable == [page(2)]
+    job.put_nowait(page(3))
+    body = job.poll(2)
+    assert body.endswith(page(2) + page(3)), 'a repeated poll still gets every unacknowledged frame'
+    job.poll(4)
+    assert job.durable == [] and job.base == 4
 
 
 def test_gallery_job_poll_tracks_pipeline_stages():

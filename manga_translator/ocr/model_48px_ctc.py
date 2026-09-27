@@ -460,37 +460,19 @@ class OCR(nn.Module):
             pred_chars.append([])
         logprobs = pred_char_logits.log_softmax(2)
         _, preds_index = logprobs.max(2)
-        preds_index = preds_index.cpu()
-        pred_color_values = pred_color_values.cpu().clamp_(0, 1)
-        for b in range(pred_char_logits.size(0)):
-            # if verbose:
-            #     print('------------------------------')
+        # One device-to-host copy per tensor. The loop used to call .item() on GPU tensors once per
+        # character (a device sync each) and index tensors element by element; the values read are
+        # the same floats either way.
+        preds_index = preds_index.cpu().tolist()
+        logprobs = logprobs.cpu()
+        pred_color_values = pred_color_values.cpu().clamp_(0, 1).tolist()
+        for b in range(len(preds_index)):
             last_ch = blank
-            for t in range(pred_char_logits.size(1)):
-                pred_ch = preds_index[b, t]
+            for t, pred_ch in enumerate(preds_index[b]):
                 if pred_ch != last_ch and pred_ch != blank:
                     lp = logprobs[b, t, pred_ch].item()
-                    # if verbose:
-                    #     if lp < math.log(0.9):
-                    #         top5 = torch.topk(logprobs[b, t], 5)
-                    #         top5_idx = top5.indices
-                    #         top5_val = top5.values
-                    #         r = ''
-                    #         for i in range(5):
-                    #             r += f'{self.dictionary[top5_idx[i]]}: {math.exp(top5_val[i])}, '
-                    #         print(r)
-                    #     else:
-                    #         print(f'{self.dictionary[pred_ch]}: {math.exp(lp)}')
-                    pred_chars[b].append((
-                        pred_ch,
-                        lp,
-                        pred_color_values[b, t][0].item(),
-                        pred_color_values[b, t][1].item(),
-                        pred_color_values[b, t][2].item(),
-                        pred_color_values[b, t][3].item(),
-                        pred_color_values[b, t][4].item(),
-                        pred_color_values[b, t][5].item()
-                    ))
+                    colors = pred_color_values[b][t]
+                    pred_chars[b].append((pred_ch, lp, colors[0], colors[1], colors[2], colors[3], colors[4], colors[5]))
                 last_ch = pred_ch
         return pred_chars
 

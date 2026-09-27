@@ -8,6 +8,7 @@ from .model_48px_ctc import Model48pxCTCOCR
 from .model_manga_ocr import ModelMangaOCR
 from .model_manga_ocr_fast import ModelMangaOCRFast
 from .model_manga_ocr_tflite import ModelMangaOCRTflite
+from .model_hayai import ModelHayaiOCR
 from .model_oneocr import OneOcrOCR
 from ..config import Ocr, OcrConfig
 from ..utils import Quadrilateral
@@ -20,6 +21,7 @@ OCRS = {
     Ocr.mocr: ModelMangaOCR,
     Ocr.mocr_fast: ModelMangaOCRFast,
     Ocr.mocr_tflite: ModelMangaOCRTflite,
+    Ocr.hayai: ModelHayaiOCR,
     Ocr.oneocr: OneOcrOCR,
 }
 ocr_cache = {}

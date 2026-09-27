@@ -1,6 +1,7 @@
 import re
 import time
 import asyncio
+from contextvars import ContextVar
 from typing import List, Tuple
 from abc import abstractmethod
 
@@ -10,6 +11,11 @@ try:
     import readline
 except Exception:
     readline = None
+
+# Set by a caller that can start on each translation as soon as it is final: called with (index
+# into the queries given to translate(), the translation exactly as translate() returns it).
+# Translators that stream their response call it; translate() still returns every translation.
+TRANSLATION_SINK: ContextVar = ContextVar('translation_sink', default=None)
 
 VALID_LANGUAGES = {
     'CHS': 'Chinese (Simplified)',
@@ -174,6 +180,23 @@ class CommonTranslator(InfererModule):
 
         queries = [queries[i] for i in query_indices]
 
+        # Lines reach the sink only when nothing later can change them: no repeat rounds and no
+        # post-editing of the whole list. Queries kept as they are go out straight away.
+        sink = TRANSLATION_SINK.get()
+        if use_mtpe or self._INVALID_REPEAT_COUNT:
+            sink = None
+        if sink is not None:
+            for i, trans in enumerate(final_translations):
+                if trans is not None:
+                    sink(i, trans)
+
+        def forward(j, raw):   # one line from _translate, finished as the list below is
+            trans = self._clean_translation_output(queries[j], raw, to_lang)
+            if to_lang == 'ARA':
+                import arabic_reshaper, bidi.algorithm
+                trans = bidi.algorithm.get_display(arabic_reshaper.reshape(trans))
+            sink(query_indices[j], trans)
+
         translations = [''] * len(queries)
         untranslated_indices = list(range(len(queries)))
         for i in range(1 + self._INVALID_REPEAT_COUNT): # Repeat until all translations are considered valid
@@ -185,7 +208,11 @@ class CommonTranslator(InfererModule):
             await self._ratelimit_sleep()
 
             # Translate
-            _translations = await self._translate(*self.parse_language_codes(from_lang, to_lang, fatal=True), queries)
+            token = TRANSLATION_SINK.set(forward if sink is not None else None)
+            try:
+                _translations = await self._translate(*self.parse_language_codes(from_lang, to_lang, fatal=True), queries)
+            finally:
+                TRANSLATION_SINK.reset(token)
 
             # Extend returned translations list to have the same size as queries
             if len(_translations) < len(queries):

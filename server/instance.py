@@ -25,6 +25,13 @@ class ExecutorInstance(BaseModel):
     # all while a non-reserve one exists — even a busy one. That is the difference between
     # "prefer the aux nodes" and "keep my GPU out of this unless everyone has gone home".
     reserve: bool = False
+    # Gallery chunks that may run on this executor at once. A second one is offered only while every
+    # chunk already on it has read all its pages (Executors.chunk_read), so its reading (detection,
+    # OCR) fills the first one's translate/inpaint/render tail instead of the GPU idling through a
+    # drain between chunks. 1 is one chunk at a time. `active`/`reading` are the chunks on it now.
+    slots: int = 1
+    active: int = 0
+    reading: int = 0
 
     @property
     def label(self) -> str:
@@ -39,8 +46,10 @@ class ExecutorInstance(BaseModel):
     async def sent_stream(self, image: Image, config: Config, sender: NotifyType):
         await fetch_data_stream("http://"+self.ip+":"+str(self.port)+"/execute/translate", image, config, sender)
 
-    async def sent_gallery_stream(self, images: List, config: Config, sender: NotifyType, batch_size: int = 0, job_token: str = ""):
-        await fetch_gallery_stream("http://"+self.ip+":"+str(self.port)+"/execute/translate_gallery_stream", images, config, sender, batch_size, job_token)
+    async def sent_gallery_stream(self, images: List, config: Config, sender: NotifyType, batch_size: int = 0, job_token: str = "",
+                                  pages: List = None, builds: str = None, context: List = None, capture: bool = True):
+        await fetch_gallery_stream("http://"+self.ip+":"+str(self.port)+"/execute/translate_gallery_stream", images, config, sender, batch_size, job_token,
+                                   pages=pages, builds=builds, context=context, capture=capture)
 
     async def cancel_gallery(self, job_token: str = ""):
         await post_cancel("http://"+self.ip+":"+str(self.port)+"/cancel_gallery", job_token)
@@ -84,16 +93,30 @@ class Executors:
         return active if active else pool
 
     def capacity(self, gallery: bool = True) -> int:
-        """How many chunks could be in flight at once if everything were free — the
-        scheduler's concurrency cap."""
+        """How many executors could take a chunk if everything were free — what chunk sizing
+        spreads a lone job over."""
         return len(self._eligible(gallery))
 
+    def slot_capacity(self, gallery: bool = True) -> int:
+        """How many chunks may be in flight at once, overlap slots included: the scheduler's cap."""
+        return sum(getattr(x, 'slots', 1) for x in self._eligible(gallery))
+
+    @staticmethod
+    def _accepting(x, gallery: bool = True) -> bool:
+        # Executors without slot accounting (aux nodes) are one chunk at a time, by their flag.
+        if not hasattr(x, 'active'):
+            return not x.busy
+        if x.active == 0:
+            return True
+        # Only gallery chunks overlap: the worker serves anything else alone.
+        return gallery and x.active < x.slots and x.reading == 0
+
     def free_executors(self, gallery: bool = True) -> int:
-        return len([item for item in self._eligible(gallery) if not item.busy])
+        return len([item for item in self._eligible(gallery) if self._accepting(item, gallery)])
 
     async def _find_instance(self, gallery: bool):
         while True:
-            free = [x for x in self._eligible(gallery) if not x.busy]
+            free = [x for x in self._eligible(gallery) if self._accepting(x, gallery)]
             if free:
                 # Preferred capacity first; ties keep registration order so two equal aux
                 # nodes still round-robin naturally as each is marked busy.
@@ -116,14 +139,36 @@ class Executors:
     async def find_executor(self, gallery: bool = True) -> ExecutorInstance:
         async with self.lock:  # Using async with for lock management
             instance = await self._find_instance(gallery)
+            if hasattr(instance, 'active'):
+                instance.active += 1
+                instance.reading += 1
             instance.busy = True
             return instance
 
-    async def free_executor(self, instance: ExecutorInstance):
+    async def free_executor(self, instance: ExecutorInstance, read_done: bool = False):
+        """A chunk (or task) on `instance` finished. `read_done`: it already reported reading
+        all its pages (chunk_read), so it no longer counts as reading."""
         from server.myqueue import task_queue
-        instance.free_executor()
+        if hasattr(instance, 'active'):
+            instance.active = max(0, instance.active - 1)
+            if not read_done:
+                instance.reading = max(0, instance.reading - 1)
+            instance.busy = not self._accepting(instance)
+        else:
+            instance.free_executor()
         self.event.set()
         self.event.clear()
         await task_queue.update_event()
+
+    def chunk_read(self, instance) -> None:
+        """A gallery chunk on `instance` has read all its pages: the instance may take another."""
+        if getattr(instance, 'reading', 0) <= 0:
+            return
+        instance.reading -= 1
+        instance.busy = not self._accepting(instance)
+        self.event.set()
+        self.event.clear()
+        from server.myqueue import task_queue
+        asyncio.get_running_loop().create_task(task_queue.update_event())
 
 executor_instances: Executors = Executors()

@@ -6,7 +6,13 @@ import string
 from typing import List, Dict
 from rich.console import Console  
 from rich.panel import Panel
-from .. import manga_translator
+import sys
+class _Pipeline:
+    # The pipeline module's console globals, looked up when used: importing that module here is
+    # circular (it imports this package) whenever this package is the first one imported.
+    def __getattr__(self, name):
+        return getattr(sys.modules.get('manga_translator.manga_translator'), name)
+manga_translator = _Pipeline()
 from .config_gpt import ConfigGPT
 from .common import CommonTranslator, MissingAPIKeyException, VALID_LANGUAGES
 from .keys import OPENAI_API_KEY, OPENAI_HTTP_PROXY, OPENAI_API_BASE, OPENAI_MODEL, OPENAI_GLOSSARY_PATH

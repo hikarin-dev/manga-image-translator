@@ -21,6 +21,7 @@ ws, shared server). The GPU thread is a daemon so it never blocks interpreter
 exit.
 """
 import asyncio
+import contextvars
 import functools
 import os
 import threading
@@ -69,7 +70,25 @@ def submit_gpu(coro, lane: int = 0):
             return coro
     except RuntimeError:
         pass
-    return asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, loop))
+    return asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_in_context(contextvars.copy_context(), coro), loop))
+
+
+async def _in_context(context, coro):
+    # A lane runs its own loop, so its task would not see the caller's context variables (which
+    # gallery run this work belongs to, where its telemetry goes). Re-bind them in the lane's task.
+    for var, value in context.items():
+        var.set(value)
+    return await coro
+
+
+async def _call(fn, args, kwargs):
+    return fn(*args, **kwargs)
+
+
+def run_gpu(fn, *args, lane: int = 0, **kwargs):
+    """Run a blocking function on a GPU lane (its model calls then stay on that lane's thread),
+    awaited from the caller's loop. For models that keep their CPU work elsewhere."""
+    return submit_gpu(_call(fn, args, kwargs), lane)
 
 
 def _ensure_cpu_pool() -> ThreadPoolExecutor:
@@ -89,7 +108,8 @@ async def run_cpu(fn, *args, **kwargs):
     loop = asyncio.get_running_loop()
     if kwargs:
         fn = functools.partial(fn, **kwargs)
-    return await loop.run_in_executor(_ensure_cpu_pool(), fn, *args)
+    # In the caller's context, like asyncio.to_thread: the pool thread's work belongs to its run.
+    return await loop.run_in_executor(_ensure_cpu_pool(), functools.partial(contextvars.copy_context().run, fn), *args)
 
 
 # ── process pool for GIL-heavy work ────────────────────────────────────────────
@@ -135,3 +155,46 @@ async def run_proc(fn, *args):
     current event loop."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_ensure_proc_pool(), fn, *args)
+
+
+# ── memory hygiene between chunks ─────────────────────────────────────────────────────────────
+async def _empty_cuda_cache():
+    import sys
+    torch = sys.modules.get('torch')
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+def _heapmin():
+    import ctypes
+    import sys
+    if sys.platform == 'win32':
+        try:
+            ctypes.CDLL('ucrtbase')._heapmin()
+        except Exception:
+            pass
+
+
+TRIM_EVERY_PAGES = 40
+_pages_since_trim = 0
+
+
+async def trim_memory(pages: int) -> bool:
+    """Give back what finished chunks left cached: PyTorch's cached VRAM (on Windows every reserved
+    byte is also charged to this process's commit, and the cache is never returned on its own), the
+    C heap's free pages (freed numpy/torch temporaries keep whole heap segments committed), and
+    unreachable reference cycles. At most every TRIM_EVERY_PAGES pages, never per page: each release
+    costs the next pages some re-allocation, and a chunk running alongside a moment's stall.
+    True when it trimmed."""
+    global _pages_since_trim
+    _pages_since_trim += pages
+    if _pages_since_trim < TRIM_EVERY_PAGES:
+        return False
+    _pages_since_trim = 0
+    import gc
+    gc.collect()
+    if _gpu_loops:
+        await submit_gpu(_empty_cuda_cache(), next(iter(_gpu_loops)))
+    await run_cpu(_heapmin)
+    return True

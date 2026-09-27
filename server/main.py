@@ -5,6 +5,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import threading
 import sys
 from argparse import Namespace
 import asyncio
@@ -14,21 +15,43 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from fastapi import FastAPI, Request, HTTPException, Header, UploadFile, File, Form, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse, Response
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse, Response, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from manga_translator import Config
+from manga_translator import stages as stage_model
+from manga_translator.page_data import context_pages
 from server import aux_pool
+from server import capabilities
 from server import edge
 from server import stats
 from server.instance import ExecutorInstance, executor_instances
 from server.myqueue import task_queue, running_galleries, GalleryQueueElement
 from server import gallery_jobs
+from server.feedback import router as feedback_router
+from server.feedback_review import router as feedback_review_router
 from server.request_extraction import get_ctx, while_streaming, start_gallery_job, TranslateRequest, BatchTranslateRequest, get_batch_ctx
 from server.to_json import to_translation, TranslationResponse
 
+# Starlette's multipart parser rejects a body carrying more than 1000 file parts. A gallery is
+# uploaded as one part per page — in a single request when the client sits on this machine — so a
+# long gallery died at parse time, before any of this server's own limits had a say. Page counts
+# are still bounded where that matters (see server/edge.py), and file parts spool to disk, so lift
+# the parser's ceiling rather than have a second, invisible cap here. FastAPI parses the form
+# before the endpoint runs and passes no arguments, so the default has to move.
+_starlette_form = Request.form
+
+def _form_without_file_cap(self, *, max_files=float('inf'), max_fields=1000, max_part_size=1024 * 1024):
+    return _starlette_form(self, max_files=max_files, max_fields=max_fields, max_part_size=max_part_size)
+
+Request.form = _form_without_file_cap
+
 app = FastAPI()
+app.include_router(feedback_router)
+app.include_router(feedback_review_router)
 nonce = None
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -72,13 +95,15 @@ async def aux_nodes() -> dict:
     return {"executors": aux_pool.nodes()}
 
 @app.get("/dashboard", response_class=HTMLResponse, tags=["ui"])
-async def dashboard() -> HTMLResponse:
+async def dashboard(req: Request) -> HTMLResponse:
     """Operator dashboard: pool state, queue, today's totals, recent jobs.
 
     Always available on loopback. Through the tunnel it is address-gated rather than
     token-gated (a browser navigation cannot carry X-Access-Token): reachable from
     MT_DASHBOARD_IPS and from whichever aux nodes are connected — see server.edge."""
-    return HTMLResponse(content=(BASE_DIR / "dashboard.html").read_text(encoding="utf-8"))
+    page = (BASE_DIR / "dashboard.html").read_text(encoding="utf-8")
+    link = '<a class="btn" href="/dashboard/feedback">Feedback</a>' if edge.feedback_operator(req) else ''
+    return HTMLResponse(content=page.replace('<!-- operator-feedback-link -->', link), headers={'Cache-Control': 'no-store'})
 
 @app.get("/dashboard/data", tags=["ui"])
 async def dashboard_data(req: Request) -> dict:
@@ -110,6 +135,34 @@ def transform_to_json(ctx):
 
 def transform_to_bytes(ctx):
     return to_translation(ctx).to_bytes()
+
+def parse_config(raw: str) -> Config:
+    """A client config, or a readable 400 naming the offending fields."""
+    try:
+        return Config.parse_raw(raw or '{}')
+    except ValidationError as exc:
+        problems = '; '.join(f"{'.'.join(str(p) for p in err.get('loc', ()))}: {err.get('msg')}"
+                             for err in exc.errors()[:5])
+        raise HTTPException(400, detail=f'invalid config: {problems}')
+    except ValueError as exc:
+        raise HTTPException(400, detail=f'invalid config: {exc}')
+
+
+MAX_PAGE_DATA_BYTES = 8 * 1024 * 1024
+AUX_FRAME_BYTES = 512 * 1024 * 1024
+# The worker parameters that change stage output, as the worker this server starts sees them.
+stage_runtime = stage_model.runtime_values({})
+
+
+def configure_stages(args):
+    """Describe the local worker's output-affecting parameters, and compute stage builds now so
+    they describe the code loaded at start-up."""
+    global stage_runtime
+    stage_runtime = stage_model.runtime_values({
+        'context_size': getattr(args, 'context_size', 0), 'pre_dict': getattr(args, 'pre_dict', None),
+        'post_dict': getattr(args, 'post_dict', None)})
+    threading.Thread(target=stage_model.warm, name='stage-builds', daemon=True).start()
+
 
 def transform_gallery_summary(summary):
     """Final (status 0) frame of a gallery stream: the worker returns a small dict
@@ -208,8 +261,9 @@ async def stream_image_form_web(req: Request, image: UploadFile = File(...), con
     conf._web_frontend_optimized = True
     return await while_streaming(req, transform_to_image, conf, img)
 
-@app.post("/translate/gallery/start", tags=["api", "form", "batch"], response_description="Create a server-owned gallery job and return immediately with its token; collect results via /translate/gallery/poll. A big gallery may arrive as several requests sharing one token (part k of n) — the job starts when the last part lands.")
-async def start_gallery(req: Request, image: list[UploadFile] = File(...), config: str = Form("{}"), batch_size: int = Form(0), job_token: str = Form(""), part: int = Form(0), parts: int = Form(1), source_url: str = Form("")) -> dict:
+@app.post("/translate/gallery/start", tags=["api", "form", "batch"], response_description="Create a server-owned gallery job and return immediately with its token; collect results via /translate/gallery/poll. A big gallery may arrive as several requests sharing one token (part k of n) — the job starts when the last part lands. Optional `stage` files (one per image, empty for none) carry a page's earlier pipeline data and the stage to run from (see manga_translator.page_data); `builds` is the signature of the stage builds the client planned against (409 when this server's differ); `context` gives a context-aware translator the pages before the first image, [{src, tr}] oldest first; `capture` false returns no pipeline data (no status-9 frames).")
+async def start_gallery(req: Request, image: list[UploadFile] = File(...), stage: list[UploadFile] = File(None), config: str = Form("{}"), batch_size: int = Form(0), job_token: str = Form(""), part: int = Form(0), parts: int = Form(1), source_url: str = Form(""), builds: str = Form(""), context: str = Form(""), capture: bool = Form(True)) -> dict:
+    req.state.benchmark = req.url.path == '/benchmark/gallery/start'
     images = [await f.read() for f in image]
     external = bool(getattr(req.state, "external", False))
     client_ip = str(getattr(req.state, "client_ip", "") or "")
@@ -217,13 +271,31 @@ async def start_gallery(req: Request, image: list[UploadFile] = File(...), confi
         err = edge.validate_pages(images)
         if err:
             raise HTTPException(413, detail=err)
-    conf = Config.parse_raw(config)
+    conf = parse_config(config)
+    page_data = None
+    if stage:
+        if len(stage) != len(images):
+            raise HTTPException(400, detail='stage files must match the images one to one')
+        page_data = []
+        for f in stage:
+            data = await f.read(MAX_PAGE_DATA_BYTES + 1)
+            if len(data) > MAX_PAGE_DATA_BYTES:
+                raise HTTPException(413, detail='page data too large')
+            page_data.append(data or None)
+        if not any(page_data):
+            page_data = None
+    if builds and builds != stage_model.signature(stage_model.stage_builds(conf, stage_runtime)):
+        raise HTTPException(409, detail='the translation server was updated since this translation was planned — try again')
+    try:
+        prior = context_pages(context) if context else None
+    except ValueError as exc:
+        raise HTTPException(400, detail=f'invalid context: {exc}')
     if parts > 1:
         if not (job_token and 1 < parts <= 200 and 0 <= part < parts):
             raise HTTPException(400, detail="bad part/parts")
-        status, assembled = gallery_jobs.add_upload_part(
+        status, assembled, page_data = gallery_jobs.add_upload_part(
             job_token, part, parts, images, client_ip,
-            max_pages=edge.MAX_PAGES_PER_JOB if external else 0)
+            max_pages=edge.MAX_PAGES_PER_JOB if external else 0, pages=page_data)
         if status == 'exists':
             return {"token": job_token, "started": True, "existing": True}
         if status == 'busy':
@@ -242,7 +314,45 @@ async def start_gallery(req: Request, image: list[UploadFile] = File(...), confi
     # would sit at 0% until the starvation guard eventually errors it.
     if executor_instances.capacity(gallery=True) == 0:
         raise HTTPException(503, detail="no translation capacity is connected right now — try again shortly")
-    return await start_gallery_job(req, transform_gallery_summary, conf, images, batch_size, job_token, source_url)
+    return await start_gallery_job(req, transform_gallery_summary, conf, images, batch_size, job_token, source_url,
+                                   pages=page_data, builds=builds or None, context=prior, capture=capture)
+
+
+app.add_api_route('/benchmark/gallery/start', start_gallery, methods=['POST'], tags=['benchmark'])
+
+
+@app.get('/benchmark/info', tags=['benchmark'])
+async def benchmark_info(req: Request):
+    external = bool(getattr(req.state, 'external', False))
+    s = await service_stats(req)
+    return {
+        'api_version': 1,
+        'limits': {
+            'starts_per_hour': edge.MAX_STARTS_PER_HOUR if external else None,
+            'max_pages': edge.MAX_PAGES_PER_JOB if external else None,
+            'max_page_bytes': edge.MAX_PAGE_BYTES if external else None,
+            'max_body_bytes': edge.MAX_BODY_BYTES if external else None,
+            'poll_interval_ms': 2000, 'no_client_grace_s': gallery_jobs.NO_CLIENT_GRACE_S,
+        },
+        'queue': s['queue'], 'workers': s['workers'], 'gpu': s['gpu'], 'uptime_s': s['uptime_s'],
+        'metrics': ['stages_s', 'waits_s', 'model_loads', 'chunk_metrics', 'gpu_avg_pct',
+                    'cpu_avg_pct', 'vram_max_mb', 'llm_requests', 'llm_cost_usd', 'reuse'],
+    }
+
+
+@app.post('/translate/gallery/resolve', tags=['api'], response_description='For a config: the effective config (fields some stage reads), the build token of each stage that applies, and the config fields each stage reads. Clients compare these with what produced their saved page data to decide which stages a run can skip. Stateless.')
+async def resolve_config(config: str = Form("{}")) -> dict:
+    conf = parse_config(config)
+    return await asyncio.to_thread(stage_model.resolve, conf, stage_runtime)
+
+
+@app.get('/capabilities', tags=['api'], response_description='What this server can run: stages, implementations (labels, versions, opaque builds, availability), options, languages and presets. Supports ETag / If-None-Match.')
+async def get_capabilities(req: Request):
+    body = await asyncio.to_thread(capabilities.document)
+    etag = '"' + body['etag'] + '"'
+    if req.headers.get('if-none-match') in (etag, body['etag']):
+        return Response(status_code=304, headers={'ETag': etag})
+    return JSONResponse(body, headers={'ETag': etag, 'Cache-Control': 'no-cache'})
 
 @app.post("/translate/gallery/poll", response_class=Response, tags=["api", "batch"], response_description="Short poll. Body = a status-7 metadata frame (JSON {cursor,status,state,done,total}) + the page/study frames produced past `since` + the terminal frame once present. All in the body (not headers) so it survives cross-origin reads.")
 async def poll_gallery(job_token: str = Form(...), since: int = Form(0)) -> Response:
@@ -275,6 +385,10 @@ async def cancel_gallery(job_token: str = Form(...)):
     if holders or queued:
         return {"cancelling": True, "queued": queued}
     return {"cancelling": known}
+
+app.add_api_route('/benchmark/gallery/poll', poll_gallery, methods=['POST'], tags=['benchmark'])
+app.add_api_route('/benchmark/gallery/cancel', cancel_gallery, methods=['POST'], tags=['benchmark'])
+
 
 @app.post("/queue-size", response_model=int, tags=["api", "json"])
 async def queue_size() -> int:
@@ -416,17 +530,129 @@ def start_translator_client_proc(host: str, port: int, nonce: str, params: Names
     base_path = os.path.dirname(os.path.abspath(__file__))
     parent = os.path.dirname(base_path)
     proc = subprocess.Popen(cmds, cwd=parent)
-    executor_instances.register(ExecutorInstance(ip=host, port=port,
-                                                 reserve=getattr(params, 'lazy', False)))
+    instance = ExecutorInstance(ip=host, port=port, reserve=getattr(params, 'lazy', False), slots=LOCAL_CHUNK_SLOTS)
+    executor_instances.register(instance)
+    _local_worker.update(proc=proc, instance=instance, cmds=cmds, cwd=parent)
 
     def handle_exit_signals(signal, frame):
-        proc.terminate()
+        _local_worker['proc'].terminate()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_exit_signals)
     signal.signal(signal.SIGTERM, handle_exit_signals)
 
     return proc
+
+
+# The local GPU worker is a child of this process, and the auto-restart wrapper only watches this
+# process. A worker that died (the system running out of memory kills it outright) used to leave
+# the pool pointing at a dead port until someone restarted the whole server, while the interrupted
+# gallery chunk burned its stall budget against the refused connection within seconds. Watch it:
+# while it is down it leaves the pool, so a queued chunk waits (myqueue.NO_EXECUTOR_TIMEOUT_S)
+# instead of failing, and a fresh worker goes back in once it is listening.
+_local_worker: dict = {}
+WORKER_RESTART_DELAY_S = 5
+# Gallery chunks the local worker runs at once: a second one reads its pages while the first finishes
+# its tail (see ExecutorInstance.slots). Must not exceed the worker's MT_WORKER_GALLERY_RUNS.
+LOCAL_CHUNK_SLOTS = int(os.getenv('MT_LOCAL_CHUNK_SLOTS', '2'))
+worker_logger = logging.getLogger('local-worker')
+# Safety net for a worker whose committed memory has crept past this budget over a long uptime
+# (fragmented C heap, allocator caches), measured after a chunk's own trim and including its process
+# pool: it leaves the rotation, finishes the chunk it is on, and restarts — seconds of model loading
+# instead of the machine running out of virtual memory mid-gallery. 0 turns it off.
+WORKER_RECYCLE_GB = float(os.getenv('MT_WORKER_RECYCLE_GB', '28'))
+
+
+def _check_worker_memory(telemetry: dict) -> None:
+    mem = telemetry.get('mem') or {}
+    if not mem.get('trimmed'):
+        return   # judged right after a trim only: before one, commit still holds freeable caches
+    commit = (mem.get('commit_end') or 0) + (mem.get('children_max') or 0)
+    if WORKER_RECYCLE_GB <= 0 or _local_worker.get('recycle') or commit <= WORKER_RECYCLE_GB:
+        return
+    if mem.get('pid') not in {pid for pid, _ in _local_worker.get('tree', [])}:
+        return   # a chunk from an aux node, not this machine's worker
+    _local_worker['recycle'] = True
+    executor_instances.unregister(_local_worker['instance'])
+    worker_logger.warning(f'Local worker holds {commit:.1f} GB of committed memory (budget '
+                          f'{WORKER_RECYCLE_GB:g} GB); restarting it once its current chunk finishes')
+
+
+def _process_tree(pid: int) -> list:
+    import psutil
+    try:
+        return [(p.pid, p.create_time()) for p in psutil.Process(pid).children(recursive=True)]
+    except psutil.Error:
+        return []
+
+
+def _kill_survivors(tree: list) -> None:
+    """A dead worker's process-pool children outlive it on Windows, each still holding a few GB
+    of committed memory. Reclaim that before a replacement spawns its own set. The creation time
+    keeps a recycled pid from matching a process that was never part of the worker."""
+    import psutil
+    for pid, created in tree:
+        try:
+            p = psutil.Process(pid)
+            if p.create_time() == created:
+                p.kill()
+        except psutil.Error:
+            pass
+
+
+async def _worker_listening(host: str, port: int) -> bool:
+    try:
+        _, writer = await asyncio.open_connection(host, port)
+    except OSError:
+        return False
+    writer.close()
+    return True
+
+
+async def _supervise_local_worker() -> None:
+    while True:
+        await asyncio.sleep(1)
+        proc = _local_worker.get('proc')
+        if proc is None:
+            continue
+        if proc.poll() is None:
+            # Kept current while it runs, because once it is dead its children can no longer be
+            # found: under a venv the spawned process is a launcher stub, and the process pool
+            # hangs off the stub's child, the real worker.
+            _local_worker['tree'] = await asyncio.to_thread(_process_tree, proc.pid)
+            if _local_worker.get('recycle') and _local_worker['instance'].active == 0:
+                # Its last chunk is done and nothing new can reach it: stop it; the exit path
+                # below brings a fresh one up.
+                await asyncio.to_thread(_kill_survivors, _local_worker['tree'])
+            continue
+        old = _local_worker['instance']
+        executor_instances.unregister(old)
+        if _local_worker.pop('recycle', False):
+            worker_logger.info(f'Local worker stopped to release its memory; restarting it in '
+                               f'{WORKER_RESTART_DELAY_S}s')
+        else:
+            worker_logger.error(f'Local worker exited (code {proc.returncode}); restarting it in '
+                                f'{WORKER_RESTART_DELAY_S}s')
+        await asyncio.to_thread(_kill_survivors, _local_worker.pop('tree', []))
+        await asyncio.sleep(WORKER_RESTART_DELAY_S)
+        proc = subprocess.Popen(_local_worker['cmds'], cwd=_local_worker['cwd'])
+        _local_worker['proc'] = proc
+        while proc.poll() is None and not await _worker_listening(old.ip, old.port):
+            await asyncio.sleep(1)
+        if proc.poll() is None:
+            instance = ExecutorInstance(ip=old.ip, port=old.port, reserve=old.reserve, slots=old.slots)
+            executor_instances.register(instance)
+            _local_worker['instance'] = instance
+            worker_logger.info(f'Local worker is back on {instance.label}')
+            # Waiting tasks re-check on this rather than at their next 5-second tick.
+            await task_queue.update_event()
+
+
+@app.on_event("startup")
+async def _start_worker_supervisor() -> None:
+    if _local_worker:
+        gallery_jobs.chunk_watchers.append(_check_worker_memory)
+        asyncio.create_task(_supervise_local_worker())
 
 def prepare(args):
     global nonce
@@ -550,6 +776,7 @@ if __name__ == '__main__':
         sys.exit(asyncio.run(aux_agent.run(args)))
 
     args.start_instance = True
+    configure_stages(args)
     proc = prepare(args)
     print("Nonce: "+nonce)
     if args.lazy:
@@ -560,7 +787,8 @@ if __name__ == '__main__':
             print("  NOTE: MT_AUX_TOKEN is unset, so no aux node can join — everything will run "
                   "locally until you set it in .env and restart.")
     try:
-        uvicorn.run(app, host=args.host, port=args.port)
+        uvicorn.run(app, host=args.host, port=args.port,
+                    ws_max_size=AUX_FRAME_BYTES)
     except Exception:
         if proc:
-            proc.terminate()
+            _local_worker['proc'].terminate()

@@ -4,10 +4,15 @@ build-backend = "maturin"
 
 [project]
 name = "shiori-renderer"
-version = "0.1.0"
-description = "Python bindings around the vendored koharu-renderer (GPL-3.0)"
+version = "0.2.0"
+description = "Python integration of the commit-pinned Koharu renderer"
 requires-python = ">=3.9"
 license = { text = "GPL-3.0-only" }
 
 [tool.maturin]
 module-name = "shiori_renderer"
+include = [
+    { path = "vendor/LICENSE-MIT", format = ["sdist", "wheel"] },
+    { path = "vendor/LICENSE-APACHE", format = ["sdist", "wheel"] },
+    { path = "UPSTREAM.md", format = ["sdist", "wheel"] },
+]

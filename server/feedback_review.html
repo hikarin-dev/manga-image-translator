@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shiori — Feedback review</title>
+  <link rel="stylesheet" href="/dashboard/feedback/review.css">
+  <script defer src="/dashboard/feedback/review.js"></script>
+</head>
+<body>
+  <header><a href="/dashboard">← Dashboard</a><h1>Feedback review</h1><span id="counts"></span></header>
+  <main>
+    <aside>
+      <form id="filters">
+        <label>Status<select id="filterStatus"><option value="">All reports</option value="new">New</option><option value="reviewed">Reviewed</option><option value="resolved">Resolved</option><option value="archived">Archived</option></select></label>
+        <label>Search<input id="search" type="search" maxlength="200" placeholder="Note, category, or report ID"></label>
+        <button type="submit">Refresh</button>
+      </form>
+      <p id="listStatus" role="status"></p><div id="reports"></div>
+      <nav><button id="previous" type="button">Previous</button><span id="pageCount"></span><button id="next" type="button">Next</button></nav>
+    </aside>
+    <section id="empty"><h2>Select a report</h2><p>Review original text, OCR, translations, and the captured page evidence.</p></section>
+    <article id="detail" hidden>
+      <div class="detail-heading"><h2 id="reportTitle"></h2><a id="download">Download evidence ZIP</a></div>
+      <p id="reportMeta"></p><p id="gaps"></p><h3>User feedback</h3><p id="userNote" class="note"></p>
+      <div class="preview-controls">
+        <label>Page image<select id="variant"><option value="original">Original page</option><option value="translated">Rendered translation</option><option value="study_background">Clean background</option></select></label>
+        <label>Region<select id="region"></select></label>
+      </div>
+      <div class="evidence">
+        <div><p id="previewStatus"></p><div id="pagePreview"><img id="pageImage" alt="Captured page"><div id="highlights"></div></div></div>
+        <div><h3>OCR / original text</h3><pre id="sourceText"></pre><h3>Raw translation</h3><pre id="rawText"></pre><h3>Displayed translation</h3><pre id="wrappedText"></pre><p id="regionInfo"></p></div>
+      </div>
+      <form id="reviewForm">
+        <h3>Private review</h3>
+        <label>Status<select id="reviewStatus"><option value="new">New</option><option value="reviewed">Reviewed</option><option value="resolved">Resolved</option><option value="archived">Archived</option></select></label>
+        <label>Operator notes<textarea id="reviewNote" rows="5" maxlength="10000"></textarea></label>
+        <button id="saveReview" type="submit">Save review</button><span id="reviewMessage" role="status"></span>
+      </form>
+      <details><summary>Captured display information</summary><pre id="displayData"></pre></details>
+    </article>
+  </main>
+</body>
+</html>

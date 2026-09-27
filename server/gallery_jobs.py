@@ -15,6 +15,7 @@ This is the standard async request/reply (job-as-a-resource) pattern, scoped to 
 import asyncio
 import json
 import logging
+import os
 import pickle
 import re
 import time
@@ -59,8 +60,10 @@ class GalleryJob:
 
     def __init__(self, token: str):
         self.token = token
+        self.benchmark = False
         self.task = None              # the GalleryQueueElement — lets the reaper/cancel forward a token-scoped abort
-        self.durable: list[bytes] = []  # status-5 (page) / status-6 (study) frames, collected by cursor
+        self.durable: list[bytes] = []  # status-9 (page data) / 5 (page) / 6 (study) frames, collected by cursor
+        self.base = 0                   # cursor of durable[0]: frames before it were acknowledged and freed
         self.terminal: bytes | None = None  # status-0 summary or status-2 error, once produced
         self.last_poll = time.monotonic()  # updated on every /poll — the heartbeat the reaper watches
         self.last_state = ''          # latest status-1 progress string (gallery-pre:k/n …)
@@ -85,8 +88,8 @@ class GalleryJob:
     # Used as the notify() sink: server.streaming.notify() calls put_nowait(encoded_frame).
     def put_nowait(self, frame: bytes) -> None:
         code = frame[0] if frame else 1
-        if code == 5 or code == 6:
-            self.durable.append(frame)        # finished page / its study layers — collected by cursor
+        if code in (5, 6, 9):
+            self.durable.append(frame)        # page data / finished page / its study layers — collected by cursor
             if code == 5:
                 self.emitted += 1
         elif code == 0 or code == 2:
@@ -127,8 +130,17 @@ class GalleryJob:
         headers — so it survives cross-origin fetches (app and translate server are different
         origins). Updating last_poll here is the polling heartbeat the reaper watches."""
         self.last_poll = time.monotonic()
-        since = max(0, min(since, len(self.durable)))
-        cursor = len(self.durable)
+        # A client advances its cursor only after it has stored what the previous poll returned,
+        # so asking from `since` acknowledges every frame before it. Free those: otherwise a long
+        # job holds all of its finished pages in this process until the job ends.
+        since = max(0, min(since, self.base + len(self.durable)))
+        if since < self.base:
+            logger.warning(f'Gallery job {self.token[:8]}… polled from cursor {since}, but frames before '
+                           f'{self.base} were already collected and freed')
+            since = self.base
+        del self.durable[:since - self.base]
+        self.base = since
+        cursor = self.base + len(self.durable)
         meta = json.dumps({
             "cursor": cursor, "status": self.status, "state": self.last_state,
             "done": self.emitted, "total": self.total,
@@ -136,7 +148,7 @@ class GalleryJob:
             "batches": self.batches, "queue": self.queue, "dispatched": self.dispatched,
         }, separators=(',', ':')).encode('utf-8')
         body = b'\x07' + len(meta).to_bytes(4, 'big') + meta
-        body += b''.join(self.durable[since:])
+        body += b''.join(self.durable)
         if self.terminal is not None:
             body += self.terminal
         return body
@@ -170,6 +182,7 @@ class _PendingUpload:
         self.parts = parts
         self.owner_ip = owner_ip
         self.got: dict[int, list] = {}
+        self.meta: dict[int, list | None] = {}
         self.created = time.monotonic()
 
     @property
@@ -178,38 +191,42 @@ class _PendingUpload:
 
     @property
     def bytes(self) -> int:
-        return sum(len(b) for imgs in self.got.values() for b in imgs)
+        return (sum(len(b) for imgs in self.got.values() for b in imgs)
+                + sum(len(d) for meta in self.meta.values() for d in (meta or ()) if d))
 
 
 _uploads: dict[str, _PendingUpload] = {}
 
 
 def add_upload_part(token: str, part: int, parts: int, images: list, owner_ip: str = '',
-                    max_pages: int = 0) -> tuple[str, list | None]:
-    """Buffer one upload part; idempotent per (token, part). Returns (status, images):
+                    max_pages: int = 0, pages: list = None) -> tuple:
+    """Buffer one upload part; idempotent per (token, part). Returns (status, images, pages):
     'exists' (job already created — a retry of an already-processed final part), 'busy'
     (buffer full), 'too_many_pages', 'pending' (more parts expected), or 'done' with the
-    full gallery assembled in part order."""
+    full gallery (and its per-page metadata, if any part sent some) assembled in part order."""
     up = _uploads.get(token)
     if up is None:
         if get(token) is not None:
-            return 'exists', None
+            return 'exists', None, None
         total_bytes = sum(u.bytes for u in _uploads.values())
         if len(_uploads) >= MAX_PENDING_UPLOADS or total_bytes >= MAX_UPLOAD_BUFFER_BYTES:
-            return 'busy', None
+            return 'busy', None, None
         up = _uploads[token] = _PendingUpload(token, max(1, int(parts)), owner_ip)
         _ensure_reaper()
     up.got[int(part)] = images
+    up.meta[int(part)] = pages
     if max_pages and up.pages > max_pages:
         _uploads.pop(token, None)
-        return 'too_many_pages', None
+        return 'too_many_pages', None, None
     if len(up.got) < up.parts:
-        return 'pending', None
+        return 'pending', None, None
     _uploads.pop(token, None)
     ordered: list = []
+    meta: list = []
     for k in sorted(up.got):
         ordered.extend(up.got[k])
-    return 'done', ordered
+        meta.extend(up.meta.get(k) or [None] * len(up.got[k]))
+    return 'done', ordered, (meta if any(meta) else None)
 
 
 def get(token: str) -> GalleryJob | None:
@@ -262,13 +279,14 @@ async def _reap_loop() -> None:
 # ── multi-tenant chunk scheduler ─────────────────────────────────────────────────────────
 # One GPU, many clients. A whole gallery as one queue element means a big job blocks every
 # later client for its full duration. Instead the scheduler owns every gallery job and feeds
-# the executor queue ONE CHUNK of pages at a time, choosing whose chunk goes next:
+# the executor queue ONE CHUNK of pages at a time, choosing whose chunk goes next. Sharing is
+# per CLIENT (see _client_of), not per job, so one client can't crowd out others by sending more:
 #
-#   • alone           — a solo job runs in large chunks (SOLO_CHUNK); near-zero overhead, and
-#                       a newcomer waits at most one chunk before being serviced.
-#   • 2..ACTIVE_MAX   — weighted round-robin over arrival order: the oldest job gets
-#                       WEIGHT_OLDEST chunks per rotation, the others one each. First-come
-#                       keeps priority, but every active client sees steady page progress.
+#   • served clients  — the first ACTIVE_CLIENTS clients by arrival, each with up to its job
+#                       allowance (CLIENT_JOBS, or PRIVILEGED_JOBS for a privileged key). A client
+#                       alone gets every free slot; with several, the least recently served
+#                       client goes next, then its least recently served job, so each active
+#                       client sees an even share of chunks. A job that hasn't started goes first.
 #   • beyond          — a waiting list: no GPU time, queue position exposed via /poll.
 #
 # Chunk sizes are multiples of the job's LLM batch cap, so translation batches are composed
@@ -276,10 +294,20 @@ async def _reap_loop() -> None:
 # (chatgpt) are never split — their context is request-local. Frames from each chunk are
 # rewritten to job-absolute page indices / progress before landing in the job buffer, so
 # clients see one continuous job.
-ACTIVE_MAX = 3
-SOLO_CHUNK = 48
+# Clients served at once (1 or more). Jobs beyond them wait with a queue position.
+ACTIVE_CLIENTS = max(1, int(os.environ.get('MT_ACTIVE_CLIENTS', '3')))
+# Jobs one client may have served at once; a privileged access key (by name) may have more.
+CLIENT_JOBS = max(1, int(os.environ.get('MT_CLIENT_JOBS', '1')))
+PRIVILEGED_KEYS = frozenset(k.strip() for k in os.environ.get('MT_PRIVILEGED_KEYS', '').split(',') if k.strip())
+PRIVILEGED_JOBS = max(1, int(os.environ.get('MT_PRIVILEGED_JOBS', '3')))
+# A lone job's chunks used to be 48 pages to amortize the drain at every chunk end. Chunks now
+# overlap on the worker (ExecutorInstance.slots), so there is no drain to amortize, and a smaller
+# chunk frees its slot sooner for a job that arrives meanwhile (see the scheduling SLA).
+SOLO_CHUNK = 16
+# A lone job with at most this many pages left goes out as one chunk: splitting a short job only
+# adds a chunk start and a translation request, and it finishes soon anyway.
+SMALL_JOB_PAGES = 24
 SHARED_CHUNK = 16
-WEIGHT_OLDEST = 2
 # How many times a job may have a chunk come back having delivered no pages at all before we
 # stop retrying and fail it. Guards against a permanently broken executor spinning forever;
 # any chunk that delivers even one page resets the count.
@@ -288,13 +316,40 @@ MAX_CHUNK_STALLS = 3
 _UNCHUNKABLE_TRANSLATORS = ('chatgpt', 'chatgpt_2stage')
 
 
+def _megapixels(images) -> dict:
+    """Median and largest page size in MP, read from the image headers only."""
+    import io
+    from PIL import Image
+    sizes = []
+    for img in images:
+        if isinstance(img, (bytes, bytearray)):
+            try:
+                w, h = Image.open(io.BytesIO(img)).size
+                sizes.append(w * h / 1e6)
+            except Exception:
+                pass
+    if not sizes:
+        return {}
+    sizes.sort()
+    return {'median': round(sizes[len(sizes) // 2], 2), 'max': round(sizes[-1], 2)}
+
+
 class _SchedJob:
     """Scheduler-side state for one gallery job. Also serves as the job's cancel handle
     while no chunk is in flight (the reaper/cancel path sets `.cancelled` on job.task)."""
 
-    def __init__(self, job, req, images, config, batch_size, transform, source_url=''):
+    def __init__(self, job, req, images, config, batch_size, transform, source_url='', pages=None, builds=None,
+                 context=None, capture=True):
         self.job = job
         self.req = req
+        # Per-page pipeline data from the client, aligned with `images` (see
+        # manga_translator.page_data), the build signature the client planned against, the
+        # earlier pages a context-aware translator starts from, and whether the client wants
+        # each page's pipeline data back.
+        self.pages = pages
+        self.builds = builds
+        self.context = context
+        self.capture = capture
         try:
             self.owner_ip = str(getattr(req.state, 'client_ip', '') or '')  # set by server.edge
             # WHICH access key authenticated this job — the name, never the secret.
@@ -347,10 +402,34 @@ class _SchedJob:
         self.tel_llm_cache_miss = 0
         self.tel_llm_cost = 0.0
         self.tel_llm_max_wall = 0.0
+        self.tel_reuse: dict[str, dict[str, int]] = {}
+        self.tel_mem: list[dict] = []          # each chunk's worker memory summary, in completion order
+        self.benchmark_chunks: list[dict] = []
+        # Submit → first delivered page: the responsiveness a waiting client actually sees.
+        self.first_page_s: float | None = None
+        self.page_mp = _megapixels(images)
+
+    def settings(self) -> dict:
+        """What decides this job's cost, so logged jobs can be compared like for like."""
+        c = self.config
+
+        def pick(section, field):
+            value = getattr(getattr(c, section, None), field, None)
+            return getattr(value, 'value', value)
+        return {
+            'detector': pick('detector', 'detector'), 'detection_size': pick('detector', 'detection_size'),
+            'ocr': pick('ocr', 'ocr'), 'translator': pick('translator', 'translator'), 'cap': self.batch_size,
+            'inpainter': pick('inpainter', 'inpainter'), 'inpainting_size': pick('inpainter', 'inpainting_size'),
+            'renderer': pick('render', 'renderer'),
+            'study': getattr(getattr(c, 'study_mode_generation', None), 'value', getattr(c, 'study_mode_generation', None)),
+            'capture': bool(self.capture), 'resumed': bool(self.pages),
+        }
 
     def fold_telemetry(self, tel: dict) -> None:
         if not isinstance(tel, dict):
             return
+        if self.job.benchmark:
+            self.benchmark_chunks.append(tel)
         self.chunks_done += 1
         llm = tel.get('llm') or {}
         if llm:
@@ -370,16 +449,22 @@ class _SchedJob:
         self.tel_cancelled = self.tel_cancelled or bool(tel.get('cancelled'))
         for k, v in (tel.get('stage_times') or {}).items():
             self.tel_stages[k] = self.tel_stages.get(k, 0.0) + float(v)
+        for stage, counts in (tel.get('reuse') or {}).items():
+            slot = self.tel_reuse.setdefault(stage, {'reused': 0, 'ran': 0})
+            for kind in ('reused', 'ran'):
+                slot[kind] += int((counts or {}).get(kind) or 0)
         for k, v in (tel.get('queue_wait') or {}).items():
             self.tel_waits[k] = self.tel_waits.get(k, 0.0) + float(v)
-        if tel.get('gpu_avg') or tel.get('gpu_max'):
+        if tel.get('gpu_avg') or tel.get('gpu_max') or (tel.get('sampling') or {}).get('gpu_samples'):
             self.tel_gpu.append((float(tel.get('gpu_avg') or 0.0), wall))
             self.tel_gpu_max = max(self.tel_gpu_max, float(tel.get('gpu_max') or 0.0))
-        if tel.get('cpu_avg') or tel.get('cpu_max'):
+        if tel.get('cpu_avg') or tel.get('cpu_max') or (tel.get('sampling') or {}).get('cpu_samples'):
             self.tel_cpu.append((float(tel.get('cpu_avg') or 0.0), wall))
             self.tel_cpu_max = max(self.tel_cpu_max, float(tel.get('cpu_max') or 0.0))
         self.tel_vram_max = max(self.tel_vram_max, float(tel.get('vram_max') or 0.0))
         self.tel_vram_total = max(self.tel_vram_total, float(tel.get('vram_total') or 0.0))
+        if tel.get('mem'):
+            self.tel_mem.append(tel['mem'])
 
     def summary_line(self) -> str:
         """The ONE gallery-level completion summary, folded across every chunk of this
@@ -407,6 +492,10 @@ class _SchedJob:
             llm_line = (
                 f'\n  LLM: {self.tel_llm_requests} requests, in={in_tok} (cache hit {hit_pct:.0f}%) '
                 f'out={out_tok} tok, slowest request={self.tel_llm_max_wall:.1f}s, ~${self.tel_llm_cost:.4f} est')
+        if any(v['reused'] for v in self.tel_reuse.values()):
+            llm_line += '\n  reuse: ' + ', '.join(
+                f'{stage}={counts["reused"]}/{counts["reused"] + counts["ran"]}'
+                for stage, counts in self.tel_reuse.items())
         return (
             f'Gallery job {self.job.token[:8]}… summary: {self.tel_emitted}/{self.total} pages emitted, '
             f'{failed} failed, {self.chunks_done} chunk(s)'
@@ -446,6 +535,8 @@ class _SchedJob:
         if tr in _UNCHUNKABLE_TRANSLATORS:
             return remaining
         cap = self.batch_size if self.batch_size > 0 else remaining
+        if solo and split <= 1 and remaining <= SMALL_JOB_PAGES:
+            return remaining
         base = SOLO_CHUNK if solo else SHARED_CHUNK
         pages = max(cap, (base // max(1, cap)) * max(1, cap))
         if split > 1:
@@ -471,6 +562,11 @@ def live_job_count() -> int:
     return len(_sched)
 
 
+def benchmark_conflict(benchmark: bool) -> bool:
+    """Benchmarks start idle; ordinary gallery starts cannot join a benchmark."""
+    return any(benchmark or sj.job.benchmark for sj in _sched.values())
+
+
 def live_jobs_for_ip(ip: str) -> int:
     """Live jobs plus in-progress multi-part uploads owned by one external client."""
     return (sum(1 for sj in _sched.values() if getattr(sj, 'owner_ip', '') == ip)
@@ -478,9 +574,9 @@ def live_jobs_for_ip(ip: str) -> int:
 
 
 def queue_snapshot() -> dict:
-    live = [t for t in _sched_order if t in _sched]
-    return {'live_jobs': len(live), 'active': min(len(live), ACTIVE_MAX),
-            'waiting': max(0, len(live) - ACTIVE_MAX), 'uploads_pending': len(_uploads)}
+    active, waiting = _served_jobs()
+    return {'live_jobs': len(active) + len(waiting), 'active': len(active),
+            'waiting': len(waiting), 'uploads_pending': len(_uploads)}
 
 
 def _record(sj: _SchedJob, cancelled: bool = False) -> None:
@@ -496,10 +592,11 @@ def _record(sj: _SchedJob, cancelled: bool = False) -> None:
         pass
 
 
-def submit(job: GalleryJob, req, images, config, batch_size, transform, source_url='') -> None:
+def submit(job: GalleryJob, req, images, config, batch_size, transform, source_url='', pages=None,
+           builds=None, context=None, capture=True) -> None:
     """Register a gallery job with the scheduler (replaces enqueueing it whole)."""
     global _sched_started
-    sj = _SchedJob(job, req, images, config, batch_size, transform, source_url)
+    sj = _SchedJob(job, req, images, config, batch_size, transform, source_url, pages, builds, context, capture)
     _sched[job.token] = sj
     _sched_order.append(job.token)
     job.task = sj
@@ -525,31 +622,72 @@ def cancel(token: str) -> bool:
     return sj is not None or job is not None
 
 
-_round_state: dict = {}   # token → chunks granted in the current rotation round
+_last_served: dict = {}   # client / job token → when it was last handed a chunk (_serve_clock)
+_serve_clock = 0
+
+
+def _client_of(sj: _SchedJob) -> str:
+    """Who a job is shared out as: its access key, else its address. Every local (loopback) job
+    is a client of its own, so a developer's separate requests are served like separate clients."""
+    key, ip = getattr(sj, 'owner_key', ''), getattr(sj, 'owner_ip', '')
+    if key == 'local' or not ip or ip.startswith('127.') or ip == '::1':
+        return 'job:' + sj.job.token
+    return ('key:' + key) if key else ('ip:' + ip)
+
+
+def _job_allowance(sj: _SchedJob) -> int:
+    return PRIVILEGED_JOBS if getattr(sj, 'owner_key', '') in PRIVILEGED_KEYS else CLIENT_JOBS
+
+
+def _served_jobs() -> tuple[list[str], list[str]]:
+    """(served, waiting) job tokens in arrival order: the jobs of the first ACTIVE_CLIENTS clients,
+    up to each client's allowance; the rest wait."""
+    served, waiting, count = [], [], {}
+    for token in _sched_order:
+        sj = _sched.get(token)
+        if sj is None:
+            continue
+        client = _client_of(sj)
+        if client not in count and len(count) >= ACTIVE_CLIENTS:
+            waiting.append(token)
+        elif count.get(client, 0) < _job_allowance(sj):
+            count[client] = count.get(client, 0) + 1
+            served.append(token)
+        else:
+            count.setdefault(client, count.get(client, 0))
+            waiting.append(token)
+    return served, waiting
 
 
 def _pick_next() -> "_SchedJob | None":
-    live = [t for t in _sched_order if t in _sched]
-    active = live[:ACTIVE_MAX]
+    global _serve_clock
+    served, waiting = _served_jobs()
     # Waiting list: expose how many jobs are ahead so clients show a queue position.
-    for i, token in enumerate(live[ACTIVE_MAX:]):
+    for i, token in enumerate(waiting):
         _sched[token].job.queue = i + 1
-    # A job whose pages are all handed out is still active (its chunks are running) but has
-    # nothing left to give — skip it so it can't consume a rotation slot or an executor.
-    active = [t for t in active if _sched[t].has_work]
-    if not active:
+    # A job whose pages are all handed out is still served (its chunks are running) but has
+    # nothing left to give — skip it so it can't consume a rotation turn or an executor.
+    ready = [t for t in served if _sched[t].has_work]
+    if not ready:
         return None
-    for k, token in enumerate(active):
-        quota = WEIGHT_OLDEST if k == 0 else 1
-        if _round_state.get(token, 0) < quota:
-            _round_state[token] = _round_state.get(token, 0) + 1
-            return _sched[token]
-    _round_state.clear()
-    _round_state[active[0]] = 1
-    return _sched[active[0]]
+    # A job that hasn't started gets the next free slot: its first page then waits only for the
+    # chunk ahead of it to finish reading, not for a whole rotation (SLA: first page within 30 s).
+    pick = next((t for t in ready if _sched[t].next_page == 0 and not _sched[t].inflight
+                 and not _sched[t].emitted), None)
+    if pick is None:
+        # Even share per client, then per job within it: least recently served first, ties by arrival.
+        order = {t: i for i, t in enumerate(ready)}
+        by_client: dict = {}
+        for t in ready:
+            by_client.setdefault(_client_of(_sched[t]), []).append(t)
+        client = min(by_client, key=lambda c: (_last_served.get(c, -1), order[by_client[c][0]]))
+        pick = min(by_client[client], key=lambda t: (_last_served.get(t, -1), order[t]))
+    _serve_clock += 1
+    _last_served[pick] = _last_served[_client_of(_sched[pick])] = _serve_clock
+    return _sched[pick]
 
 
-def _make_adapter(sj: _SchedJob, chunk_start: int, state: dict):
+def _make_adapter(sj: _SchedJob, chunk_start: int, state: dict, element=None):
     """Per-chunk notify sink: rewrites chunk-local frames into job-absolute ones before
     they land in the job buffer, and merges intermediate summaries. Never emits the job's
     terminal frame — with chunks in flight on several executors, only _maybe_finish knows
@@ -557,7 +695,7 @@ def _make_adapter(sj: _SchedJob, chunk_start: int, state: dict):
     from server.streaming import notify
 
     def adapter(code: int, data: bytes) -> None:
-        if code in (5, 6):
+        if code in (5, 6, 9):
             # tokenLen(1) + token + idx(4 BE) + payload → add the chunk's page offset.
             tlen = data[0]
             b = 1 + tlen
@@ -567,6 +705,8 @@ def _make_adapter(sj: _SchedJob, chunk_start: int, state: dict):
                 # Delivered pages: what a failed chunk must NOT redo, and what tells the
                 # scheduler the job is done.
                 sj.emitted.add(idx)
+                if sj.first_page_s is None:
+                    sj.first_page_s = round(time.monotonic() - sj.submitted_at, 1)
             notify(code, data, sj.transform, sj.job)
         elif code == 1:
             s = data.decode('utf-8', 'ignore')
@@ -575,6 +715,14 @@ def _make_adapter(sj: _SchedJob, chunk_start: int, state: dict):
                 # All three progress kinds are page-based (a/n within the chunk) —
                 # offset into job-absolute pages uniformly.
                 kind, a = mm.group(1), int(mm.group(2))
+                if kind == 'pre' and a >= int(mm.group(3)) and element is not None \
+                        and not getattr(element, 'read_done', False):
+                    # Every page of this chunk is read: its executor can start the next chunk's
+                    # reading while this one translates, inpaints and renders its tail.
+                    element.read_done = True
+                    if getattr(element, 'instance', None) is not None:
+                        executor_instances.chunk_read(element.instance)
+                        _sched_event.set()   # a slot opened: hand out the next chunk now
                 s = f'gallery-{kind}:{chunk_start + a}/{sj.total}'
             notify(1, s.encode('utf-8'), sj.transform, sj.job)
         elif code == 0:
@@ -588,6 +736,11 @@ def _make_adapter(sj: _SchedJob, chunk_start: int, state: dict):
             if isinstance(summary, dict):
                 sj.failed.extend(chunk_start + int(i) for i in summary.get('failed', []))
                 sj.fold_telemetry(summary.get('telemetry'))
+                for watch in chunk_watchers:
+                    try:
+                        watch(summary.get('telemetry') or {})
+                    except Exception as e:
+                        logger.warning(f'chunk watcher failed: {e}')
             # Chunk summaries are only ever folded. The job's own terminal frame is emitted by
             # _maybe_finish once every chunk — including any that had to be redone — is in.
         elif code == 2:
@@ -603,9 +756,22 @@ def _make_adapter(sj: _SchedJob, chunk_start: int, state: dict):
     return adapter
 
 
+def _can_start_now() -> bool:
+    """Late binding: hand out a chunk only when an executor can start it now. A chunk dispatched
+    early would sit first in the worker queue, so a job arriving meanwhile would wait behind it
+    however the rotation ranks it. With no executor at all, one chunk still goes out, to wait for
+    capacity (myqueue.NO_EXECUTOR_TIMEOUT_S) and fail the job cleanly if none comes."""
+    from server.myqueue import task_queue, GalleryQueueElement
+    waiting = sum(1 for t in task_queue.queue if isinstance(t, GalleryQueueElement))
+    if executor_instances.slot_capacity() == 0:
+        return _inflight_chunks == 0
+    return executor_instances.free_executors(gallery=True) > waiting
+
+
 def _drop(token: str) -> None:
     _sched.pop(token, None)
-    _round_state.pop(token, None)
+    _last_served.pop(token, None)
+    _last_served.pop('job:' + token, None)
     try:
         _sched_order.remove(token)
     except ValueError:
@@ -613,6 +779,10 @@ def _drop(token: str) -> None:
 
 
 _inflight_chunks = 0    # chunks running across the whole pool, the concurrency accounting
+
+# Called with each finished chunk's telemetry while its executor is still marked busy, so a
+# watcher can take that executor out of rotation before the next chunk is handed to it.
+chunk_watchers: list = []
 
 
 def _maybe_finish(sj: _SchedJob) -> None:
@@ -624,7 +794,11 @@ def _maybe_finish(sj: _SchedJob) -> None:
     from server.streaming import notify
     logger.info(sj.summary_line())
     _record(sj)
-    notify(0, pickle.dumps({'count': sj.total, 'failed': sorted(set(sj.failed))}), sj.transform, sj.job)
+    summary = {'count': sj.total, 'failed': sorted(set(sj.failed))}
+    if sj.job.benchmark:
+        from server.benchmark import job_metrics
+        summary['benchmark'] = job_metrics(sj)
+    notify(0, pickle.dumps(summary), sj.transform, sj.job)
     _drop(sj.job.token)
 
 
@@ -647,7 +821,9 @@ def _dispatch(sj: _SchedJob, start: int, end: int):
     from server.myqueue import task_queue, GalleryQueueElement
     global _inflight_chunks
     element = GalleryQueueElement(sj.req, sj.images[start:end], sj.config, sj.batch_size,
-                                  sj.job.token, parent=sj)
+                                  sj.job.token, parent=sj,
+                                  pages=sj.pages[start:end] if sj.pages else None, builds=sj.builds,
+                                  context=sj.context if start == 0 else None, capture=sj.capture)
     element.cancelled = sj.cancelled
     sj.inflight.add(element)
     _inflight_chunks += 1
@@ -663,7 +839,7 @@ async def _run_chunk(sj: _SchedJob, element, start: int, end: int) -> None:
 
     state: dict = {}
     try:
-        await wait_in_queue(element, _make_adapter(sj, start, state))
+        await wait_in_queue(element, _make_adapter(sj, start, state, element))
     except Exception as e:
         state['error'] = str(e) or e.__class__.__name__
     finally:
@@ -729,12 +905,13 @@ async def _sched_loop() -> None:
         # Fill the pool: keep dispatching while an executor could still pick work up. Without
         # this the whole pool is worth one executor, since a second one would never be handed
         # a chunk until the first had finished its own.
-        while _inflight_chunks < max(1, executor_instances.capacity()):
+        while _inflight_chunks < max(1, executor_instances.slot_capacity()) and _can_start_now():
             sj = _pick_next()
             if sj is None:
                 break
-            live = [t for t in _sched_order if t in _sched]
-            claimants = [t for t in live[:ACTIVE_MAX] if _sched[t].has_work]
+            served, waiting = _served_jobs()
+            live = served + waiting
+            claimants = [t for t in served if _sched[t].has_work]
             solo = len(claimants) <= 1
             # When one job has the pool to itself, size its chunks to spread over the whole
             # pool; when jobs are already competing they spread across executors on their own.
@@ -748,7 +925,7 @@ async def _sched_loop() -> None:
                 logger.info(
                     f'Gallery job {sj.job.token[:8]}… chunk {start}-{end - 1}/{sj.total} '
                     f'({len(live)} live, {_inflight_chunks} chunk(s) in flight, '
-                    f'{max(0, len(live) - ACTIVE_MAX)} waiting)')
+                    f'{len(waiting)} waiting)')
             asyncio.create_task(_run_chunk(sj, element, start, end))
 
         # Wake on a submission or a finished chunk; also tick so waiting-list positions and

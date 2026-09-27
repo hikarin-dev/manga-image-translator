@@ -559,7 +559,7 @@ def put_char_vertical(font_size: int, cdpt: str, pen_l: Tuple[int, int], canvas_
     # Return vertical advance value  
     return char_offset_y  
 
-def put_text_vertical(font_size: int, text: str, h: int, alignment: str, fg: Tuple[int, int, int], bg: Optional[Tuple[int, int, int]], line_spacing: int):
+def put_text_vertical(font_size: int, text: str, h: int, alignment: str, fg: Tuple[int, int, int], bg: Optional[Tuple[int, int, int]], line_spacing: int, layout=None):
     text = compact_special_symbols(text)
     if not text :
         return
@@ -572,6 +572,8 @@ def put_text_vertical(font_size: int, text: str, h: int, alignment: str, fg: Tup
     canvas_x = font_size * num_char_x + spacing_x * (num_char_x - 1) + (font_size + bg_size) * 2
     canvas_y = font_size * num_char_y + (font_size + bg_size) * 2
     line_text_list, line_height_list = calc_vertical(font_size, text, h)
+    if layout is not None:
+        layout.extend(line_text_list)
     # print(line_text_list, line_height_list)
 
     canvas_text = np.zeros((canvas_y, canvas_x), dtype=np.uint8)
@@ -886,6 +888,9 @@ def calc_horizontal(font_size: int, text: str, max_width: int, max_height: int, 
             elif use_hyphen_chars and syl_end_idx != len(syllables[word_idx]) and len(words[word_idx]) > 3 and line_text[-1] != '-' \
                 and not (syl_end_idx < len(syllables[word_idx]) and not re.search(r'\w', syllables[word_idx][syl_end_idx][0])):
                 line_text += '-'
+                insertions = getattr(_tls, 'snapshot_inserted_hyphens', None)
+                if insertions is not None:
+                    insertions.append(i)
                 # hyphen_offset was ignored in previous steps
                 line_width_list[i] += hyphen_offset_x
 
@@ -897,6 +902,11 @@ def calc_horizontal(font_size: int, text: str, max_width: int, max_height: int, 
         line_text_list.append(line_text)
 
     return line_text_list, line_width_list
+
+
+def glyph_stroke_width(font_size, border_size):
+    """Outward glyph radius in pixels; border_size only enables the stroke."""
+    return max(int(0.07 * font_size), 1) if border_size > 0 else 0
 
 
 def put_char_horizontal(font_size: int, cdpt: str, pen_l: Tuple[int, int], canvas_text: np.ndarray, canvas_border: np.ndarray, border_size: int):
@@ -1009,7 +1019,7 @@ def put_char_horizontal(font_size: int, cdpt: str, pen_l: Tuple[int, int], canva
         
         # Configure stroker 配置描边器
         stroker = freetype.Stroker()
-        stroke_radius = 64 * max(int(0.07 * font_size), 1)  # In 1/64 pixel units 单位: 1/64 像素
+        stroke_radius = 64 * glyph_stroke_width(font_size, border_size)  # In 1/64 pixel units
         stroker.set(stroke_radius, 
                    freetype.FT_STROKER_LINEJOIN_ROUND,  # Round joins 圆角连接
                    freetype.FT_STROKER_LINECAP_ROUND,   # Round line caps 圆头线帽
@@ -1120,7 +1130,7 @@ def put_char_horizontal(font_size: int, cdpt: str, pen_l: Tuple[int, int], canva
 
 def put_text_horizontal(font_size: int, text: str, width: int, height: int, alignment: str,
                         reversed_direction: bool, fg: Tuple[int, int, int], bg: Tuple[int, int, int],
-                        lang: str = 'en_US', hyphenate: bool = True, line_spacing: int = 0):
+                        lang: str = 'en_US', hyphenate: bool = True, line_spacing: int = 0, layout=None):
     text = compact_special_symbols(text)
     if not text :
         return
@@ -1130,6 +1140,8 @@ def put_text_horizontal(font_size: int, text: str, width: int, height: int, alig
     # calc
     # print(width)
     line_text_list, line_width_list = calc_horizontal(font_size, text, width, height, lang, hyphenate)
+    if layout is not None:
+        layout.extend(line_text_list)
     # print(line_text_list, line_width_list)
 
     # make large canvas

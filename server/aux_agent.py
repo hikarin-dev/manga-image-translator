@@ -187,7 +187,9 @@ class _Relay:
                 self.worker_url + '/execute/translate_gallery_stream',
                 attrs['images'], attrs['config'],
                 lambda status, data: frames.put_nowait((status, data)),
-                attrs.get('batch_size', 0), attrs.get('job_token', ''))
+                attrs.get('batch_size', 0), attrs.get('job_token', ''),
+                pages=attrs.get('pages'), builds=attrs.get('builds'), context=attrs.get('context'),
+                capture=attrs.get('capture', True))
             logger.info(f'chunk {cid}: done in {time.monotonic() - started:.1f}s')
         except Exception as e:
             error = str(e) or e.__class__.__name__

@@ -112,6 +112,7 @@ class Ocr(str, Enum):
     mocr = "mocr"
     mocr_fast = "mocr_fast"
     mocr_tflite = "mocr_tflite"
+    hayai = "hayai"
     oneocr = "oneocr"
 
 class Translator(str, Enum):
@@ -329,6 +330,10 @@ class ColorizerConfig(BaseModel):
 
 class OcrConfig(BaseModel):
     use_mocr_merge: bool = False
+    bubble_ocr: bool = False
+    """Read each text region (a bubble's lines, grouped before OCR) as one crop instead of line by
+    line, for OCR models built for whole regions (Hayai). The text detector still runs: inpainting
+    needs its text mask. Other OCR models ignore it."""
     """Use bbox merge when Manga OCR inference."""
     ocr: Ocr = Ocr.ocr48px
     """Optical character recognition (OCR) model to use"""

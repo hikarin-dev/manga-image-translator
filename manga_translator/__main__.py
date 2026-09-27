@@ -1,5 +1,10 @@
 import os
 import sys
+
+# PyTorch reads its allocator policy when CUDA starts, so it is set before anything imports torch:
+# give idle cached blocks back once usage passes 60% of the budget (manga_translator.py sets the
+# budget), and don't split blocks over 512 MB, so big page-sized buffers don't fragment the cache.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'garbage_collection_threshold:0.6,max_split_size_mb:512')
 import asyncio
 import logging
 from argparse import Namespace

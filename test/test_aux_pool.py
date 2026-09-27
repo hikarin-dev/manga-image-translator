@@ -96,7 +96,7 @@ def pool():
     from server.myqueue import task_queue, running_galleries
     gj._sched.clear()
     gj._sched_order.clear()
-    gj._round_state.clear()
+    gj._last_served.clear()
     gj._jobs.clear()
     gj._inflight_chunks = 0
     gj._sched_started = False
@@ -642,6 +642,8 @@ def _client(ip=None):
 def test_dashboard_always_available_locally(pool):
     c = _client()
     assert c.get('/dashboard').status_code == 200
+    assert 'href="/dashboard/feedback"' in c.get('/dashboard').text
+    assert c.get('/dashboard/feedback').status_code == 200
     assert c.get('/dashboard/data').status_code == 200
 
 
@@ -658,6 +660,7 @@ def test_dashboard_reachable_from_an_allowlisted_address(pool, monkeypatch):
     import server.edge as edge
     monkeypatch.setattr(edge, 'DASHBOARD_NETS', edge._parse_nets('203.0.113.7, 198.51.100.0/24'))
     assert _client('203.0.113.7').get('/dashboard').status_code == 200      # exact
+    assert 'href="/dashboard/feedback"' in _client('203.0.113.7').get('/dashboard').text
     assert _client('198.51.100.42').get('/dashboard').status_code == 200    # inside the CIDR
     assert _client('192.0.2.1').get('/dashboard').status_code == 404        # outside both
 
@@ -676,6 +679,8 @@ def test_connected_aux_node_gets_dashboard_access(pool, monkeypatch):
     executor_instances.register(node)
     assert aux_mod.connected_ips() == {'203.0.113.55'}
     assert _client('203.0.113.55').get('/dashboard').status_code == 200, 'node connected'
+    assert '/dashboard/feedback' not in _client('203.0.113.55').get('/dashboard').text
+    assert _client('203.0.113.55').get('/dashboard/feedback/list').status_code == 404
     assert _client('203.0.113.56').get('/dashboard').status_code == 404, 'a neighbour is not'
 
     executor_instances.unregister(node)

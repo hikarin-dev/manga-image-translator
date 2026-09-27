@@ -13,9 +13,9 @@ new machine, not a hostname + certificate + inbound exposure per node.
 
 Wire protocol (AUX_PROTOCOL), after the socket is accepted:
 
-  aux → us   text    {"protocol":1,"token":…,"name":…,"version":…,"caps":{…}}   (once)
+  aux → us   text    {"protocol":3,"token":…,"name":…,"version":…,"caps":{…}}   (once)
   us  → aux  text    {"ok":true,"aux_id":…}  |  {"ok":false,"error":…} then close
-  us  → aux  binary  chunk_id(4 BE) + pickle({images, config, batch_size, job_token})
+  us  → aux  binary  chunk_id(4 BE) + pickle({images, config, batch_size, job_token, pages?, builds?, context?, capture?})
   us  → aux  text    {"type":"cancel","chunk":id}
   aux → us   binary  chunk_id(4 BE) + status(1) + frame payload
   aux → us   text    {"type":"end","chunk":id,"error":null|"…"}
@@ -47,7 +47,7 @@ if not logger.handlers:
 
 # Bump when the wire format above changes incompatibly. A mismatch is always fatal —
 # there is no negotiation, because a half-understood chunk is worse than no aux node.
-AUX_PROTOCOL = 1
+AUX_PROTOCOL = 3
 
 JOIN_TOKEN = (os.getenv('MT_AUX_TOKEN') or '').strip()
 # Aux nodes are preferred over the local worker (lower sorts first in Executors), so remote
@@ -116,12 +116,21 @@ class AuxInstance:
         self.busy = False
 
     # ── dispatch ─────────────────────────────────────────────────────────────────────────
-    async def sent_gallery_stream(self, images: list, config, sender, batch_size: int = 0, job_token: str = ""):
+    async def sent_gallery_stream(self, images: list, config, sender, batch_size: int = 0, job_token: str = "",
+                                  pages: list = None, builds: str = None, context: list = None, capture: bool = True):
         cid = next(self._chunk_ids)
         chunk = _Chunk(sender, job_token)
         self._pending[cid] = chunk
-        payload = pickle.dumps({"images": images, "config": config,
-                                "batch_size": batch_size, "job_token": job_token})
+        attrs = {"images": images, "config": config, "batch_size": batch_size, "job_token": job_token}
+        if pages and any(pages):
+            attrs["pages"] = pages
+        if builds:
+            attrs["builds"] = builds
+        if context:
+            attrs["context"] = context
+        if not capture:
+            attrs["capture"] = False
+        payload = pickle.dumps(attrs)
         try:
             await self.ws.send_bytes(cid.to_bytes(4, 'big') + payload)
         except Exception as e:

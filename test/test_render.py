@@ -47,3 +47,27 @@ async def test_default_renderer():
 
     img_rendered = await dispatch_rendering(img, regions, hyphenate=False)
     save_result('default1.png', img_rendered, regions)
+
+
+def test_default_and_pillow_renderers_record_the_area_they_lay_text_into():
+    import asyncio
+    from pathlib import Path
+    from manga_translator.rendering import dispatch_eng_render_pillow
+    font = str(Path(__file__).resolve().parents[1] / 'fonts' / 'ccvictoryspeech.ttf')
+    page = np.full((240, 320, 3), 255, np.uint8)
+    cv2.ellipse(page, (160, 120), (130, 90), 0, 0, 360, (0, 0, 0), 3)
+
+    def regions():
+        return [TextBlock([[[110, 90], [210, 90], [210, 150], [110, 150]]], texts=['source'],
+                          translation='Hello there', font_size=20, target_lang='ENG',
+                          fg_color=(0, 0, 0), bg_color=(255, 255, 255))]
+
+    default = regions()
+    asyncio.run(dispatch_rendering(page.copy(), default, font, hyphenate=False))
+    # The quadrilateral the text is warped into — here widened past the source box to fit it.
+    assert default[0]._drawn_shape == [(110, 90), (310, 90), (310, 150), (110, 150)]
+    pillow = regions()
+    asyncio.run(dispatch_eng_render_pillow(page.copy(), page, pillow, font))
+    xs, ys = zip(*pillow[0]._drawn_shape)
+    # The balloon around the text, not the text's own box.
+    assert min(xs) < 110 and max(xs) > 210 and min(ys) < 90 and max(ys) > 150

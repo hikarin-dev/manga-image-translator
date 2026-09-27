@@ -13,24 +13,35 @@ publish.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
 image = { workspace = true }
-imageproc = { workspace = true }
-once_cell = { workspace = true }
+koharu-config = { workspace = true }
+koharu-rasterizer = { workspace = true, features = ["native"] }
+koharu-scene = { workspace = true }
+koharu-runtime = { workspace = true }
 skrifa = { workspace = true }
 harfrust = { workspace = true }
 hypher = { workspace = true }
+icu_normalizer = { workspace = true }
 icu_properties = { workspace = true, features = ["compiled_data"] }
 icu_segmenter = { workspace = true, features = ["compiled_data"] }
 jieba-rs = { workspace = true }
 unicode-bidi = { workspace = true }
-fontdb = { workspace = true }
-fontdue = { workspace = true }
-tiny-skia = { workspace = true }
+fontique = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+specta = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rayon = { workspace = true }
 tracing = { workspace = true }
-blake3 = { workspace = true }
+vello = { workspace = true }
+webp = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]

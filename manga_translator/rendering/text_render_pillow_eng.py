@@ -5,7 +5,7 @@ from typing import List
 
 from .ballon_extractor import extract_ballon_region
 from ..utils import TextBlock
-from .text_render_eng import seg_eng
+from .text_render_eng import balloon_outline, seg_eng
 
 def merge_seg_eng(text: str, font, bbox_width, size_ratio=1.2) -> List[str]:
     """Segments text into words that fit within bbox_width"""
@@ -114,7 +114,7 @@ def render_textblock_list_eng(
     downscale_constraint: float = 0.7,
     original_img: np.ndarray = None,
     max_font_size: int = 300,
-    bounds_padding: int = 3
+    bounds_padding: int = 3,
 ) -> np.ndarray:
     """Render text blocks onto image"""
 
@@ -140,6 +140,7 @@ def render_textblock_list_eng(
             region.enlarged_xyxy[[1,3]] += [-h_diff, h_diff]
 
     bboxes, rotated_text_layers, sws = [], [], []
+    drawn_regions = []
     x, y = img.shape[1], img.shape[0]
 
     for region in text_regions:
@@ -155,6 +156,8 @@ def render_textblock_list_eng(
         sw, line_height, delimiter_len, base_length, word_lengths = calculate_font_values(font, words)
         ballon_area = (ballon_mask > 0).sum()
         rx, ry = 0, 0
+        # The balloon this text is sized against, in page coordinates.
+        region._drawn_shape = balloon_outline(ballon_mask, xyxy[0], xyxy[1])
 
         region.angle = -region.angle
         if abs(region.angle) > 3:
@@ -241,6 +244,9 @@ def render_textblock_list_eng(
         ])
         rotated_text_layers.append(rotated_text_layer)
         sws.append(sw)
+        drawn_regions.append(region)
+        region._drawn_lines = list(words)
+        region._drawn_font_size = font_size
 
     # Resolve collisions
     new_bboxes = solve_collisions_spiral_xyxy((x, y), [b[1] for b in bboxes])
@@ -248,6 +254,7 @@ def render_textblock_list_eng(
         offset = [new_bbox[j] - bboxes[i][1][j] for j in range(4)]
         for j in range(4):
             bboxes[i][0][j] += int(offset[j])
+        drawn_regions[i]._drawn_rect = list(bboxes[i][0])
 
     # Apply strokes and paste text
     img_pil = img_pil.convert("RGB")

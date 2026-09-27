@@ -258,6 +258,8 @@ async def dispatch(
         # Render text
         out = img
         for region, dst_points in tqdm(zip(regions, dst_points_list), '[render]', total=len(regions)):
+            # The quadrilateral this text is warped into, in page coordinates.
+            region._drawn_shape = [(float(x), float(y)) for x, y in np.asarray(dst_points).reshape(-1, 2)]
             if render_mask is not None:
                 # set render_mask to 1 for the region that is inside dst_points
                 cv2.fillConvexPoly(render_mask, dst_points.astype(np.int32), 1)
@@ -266,7 +268,12 @@ async def dispatch(
 
     # Rendering is CPU-bound (font rasterization + perspective warps); run it on the
     # shared CPU pool so it overlaps with GPU detection/OCR/inpainting of other pages.
-    return await run_cpu(_sync)
+    def _recorded_sync():
+        try:
+            return _sync()
+        finally:
+            text_render._tls.snapshot_inserted_hyphens = None
+    return await run_cpu(_recorded_sync)
 
 def render(
     img,
@@ -301,6 +308,10 @@ def render(
 
     #print(f"Region text: {region.text}, forced_direction: {forced_direction}, render_horizontally: {render_horizontally}")
 
+    region._drawn_lines = []
+    region._drawn_inserted_hyphens = []
+    text_render._tls.snapshot_inserted_hyphens = region._drawn_inserted_hyphens
+    region._drawn_font_size = region.font_size
     if render_horizontally:
         temp_box = text_render.put_text_horizontal(
             region.font_size,
@@ -314,6 +325,7 @@ def render(
             region.target_lang,
             hyphenate,
             line_spacing,
+            layout=region._drawn_lines,
         )
     else:
         temp_box = text_render.put_text_vertical(
@@ -324,6 +336,7 @@ def render(
             fg,
             bg,
             line_spacing,
+            layout=region._drawn_lines,
         )
     h, w, _ = temp_box.shape
     r_temp = w / h
@@ -409,6 +422,8 @@ def render(
     #src_pts[:, 1] = np.clip(np.round(src_pts[:, 1]), 0, enlarged_h * 2)
 
     M, _ = cv2.findHomography(src_points, dst_points, cv2.RANSAC, 5.0)
+    region._drawn_homography = M.copy()
+    region._drawn_quad = dst_points.copy()
     rgba_region = cv2.warpPerspective(box, M, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     x, y, w, h = cv2.boundingRect(dst_points.astype(np.int32))
     canvas_region = rgba_region[y:y+h, x:x+w, :3]
@@ -416,7 +431,7 @@ def render(
     img[y:y+h, x:x+w] = np.clip((img[y:y+h, x:x+w].astype(np.float32) * (1 - mask_region) + canvas_region.astype(np.float32) * mask_region), 0, 255).astype(np.uint8)
     return img
 
-async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False, verbose: bool = False, page_bubbles: List[np.ndarray] = None) -> np.ndarray:
+async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False, verbose: bool = False, page_bubbles: List[np.ndarray] = None, safe_layout: bool = False) -> np.ndarray:
     if len(text_regions) == 0:
         return img_canvas
 
@@ -427,7 +442,7 @@ async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, 
     def _sync():
         # set_font MUST run on the same thread as the render — font faces are thread-local.
         text_render.set_font(font_path)
-        return render_textblock_list_eng(img_canvas, text_regions, line_spacing=line_spacing, size_tol=1.2, original_img=original_img, downscale_constraint=0.8, disable_font_border=disable_font_border, verbose=verbose, page_bubbles=page_bubbles)
+        return render_textblock_list_eng(img_canvas, text_regions, line_spacing=line_spacing, size_tol=1.2, original_img=original_img, downscale_constraint=0.8, disable_font_border=disable_font_border, verbose=verbose, page_bubbles=page_bubbles, safe_layout=safe_layout)
     return await run_cpu(_sync)
 
 async def dispatch_eng_render_pillow(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False) -> np.ndarray:
