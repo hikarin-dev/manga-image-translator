@@ -108,6 +108,11 @@ def apply_dictionary(text, dictionary):
 
 # Study-payload builders live in study_layers.py so the process pool can import them without this
 # module (and torch). Re-exported here under their old names.
+# Set by an aux node for its worker (server/aux_agent.py): pages translated for someone else's
+# server must never reach this machine's disk. No log file (it records every source text,
+# translation and LLM prompt) and no --verbose stage images; everything stays in memory.
+EPHEMERAL = os.environ.get('MT_EPHEMERAL') == '1'
+
 from .study_layers import (STUDY_LAYERS, _build_page_layers_job, _furi_lines, _furi_seg_append,  # noqa: F401
                            _has_kanji, _study_bg, _study_img_data_url, _study_meta_bubble, _study_norm)
 
@@ -217,7 +222,8 @@ class MangaTranslator:
         self._saved_image_contexts = {}     # 存储批量处理中每个图片的上下文信息
         
         # 设置日志文件
-        self._setup_log_file()
+        if not EPHEMERAL:
+            self._setup_log_file()
 
     def _setup_log_file(self):
         """设置日志文件，在result文件夹下创建带时间戳的log文件"""
@@ -346,7 +352,7 @@ class MangaTranslator:
             'font_path': self.font_path})
 
     def parse_init_params(self, params: dict):
-        self.verbose = params.get('verbose', False)
+        self.verbose = params.get('verbose', False) and not EPHEMERAL
         self.use_mtpe = params.get('use_mtpe', False)
         self.font_path = params.get('font_path', None)
         self.models_ttl = params.get('models_ttl', 0)
@@ -735,7 +741,7 @@ class MangaTranslator:
                 logger.debug(f"Exception details: {traceback.format_exc()}")
 
         # Web流式模式优化：保存final.png并使用占位符
-        if ctx.result and not self.result_sub_folder and hasattr(self, '_is_streaming_mode') and self._is_streaming_mode:
+        if ctx.result and not self.result_sub_folder and getattr(self, '_is_streaming_mode', False) and not EPHEMERAL:
             # 保存final.png文件
             final_img = np.array(ctx.result)
             if len(final_img.shape) == 3:  # 彩色图片，转换BGR顺序

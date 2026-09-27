@@ -14,12 +14,14 @@ frames that come back are forwarded verbatim too. No translation logic lives her
 what keeps an aux node from drifting away from the main server's behaviour.
 """
 import asyncio
+import collections
 import json
 import logging
 import os
 import pickle
 import subprocess
 import sys
+import threading
 import time
 from urllib.parse import urlparse, urlunparse
 
@@ -41,6 +43,7 @@ MAX_MESSAGE_BYTES = 256 * 1024 * 1024
 RECONNECT_MIN_S = 2.0
 RECONNECT_MAX_S = 30.0
 WORKER_READY_TIMEOUT_S = 900.0
+WORKER_TAIL_LINES = 200   # the worker's last output lines, kept in memory for a failure report
 
 
 def join_url(base: str) -> str:
@@ -80,15 +83,15 @@ def spawn_worker(port: int, args) -> subprocess.Popen:
     """Start the translator worker on loopback. Same invocation the main server uses for its
     own worker, minus the executor registration — here the agent is the only caller.
 
-    An aux node is somebody's spare desktop, not an operator console, so it stays quiet:
+    An aux node is somebody's spare desktop lending its GPU, and the pages it translates belong
+    to someone else, so nothing of them may reach its disk:
 
-      * `--verbose` is never forwarded. On the worker that flag writes every intermediate
-        pipeline image plus final.png into result/ for each page — gigabytes of someone
-        else's manga accumulating on a machine that is only lending its GPU.
-      * the worker's own stdout/stderr (model loading, per-page OCR, translation chatter)
-        goes to logs/aux-worker.log instead of the console, which leaves only this agent's
-        one line per chunk visible. Pass --verbose to the AGENT to watch it live instead;
-        that still doesn't turn on the worker's result/ dumping.
+      * the worker runs with MT_EPHEMERAL=1: no log file under result/ (it records every source
+        text, translation and LLM prompt) and no --verbose stage images, whatever flags it gets.
+      * the worker's own stdout/stderr (model loading, per-page OCR, translation chatter) is
+        kept in memory, its last WORKER_TAIL_LINES lines only, and printed here if the worker
+        fails. Pass --verbose to the AGENT to watch it live on this console instead; that is
+        still never written to disk.
     """
     cmds = [sys.executable, '-m', 'manga_translator', 'shared',
             '--host', '127.0.0.1', '--port', str(port), '--nonce', 'None']
@@ -106,19 +109,29 @@ def spawn_worker(port: int, args) -> subprocess.Popen:
         cmds.extend(['--post-dict', args.post_dict])
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sink = None
-    if not getattr(args, 'verbose', False):
-        log_dir = os.path.join(root, 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-        path = os.path.join(log_dir, 'aux-worker.log')
-        # Kept, not discarded: when a node won't start, this file is the only diagnosis.
-        sink = open(path, 'ab', buffering=0)
-        logger.info(f'worker output -> {path}')
+    env = dict(os.environ, MT_EPHEMERAL='1')
+    tail = collections.deque(maxlen=WORKER_TAIL_LINES)
     logger.info(f'starting local worker on 127.0.0.1:{port}')
-    proc = subprocess.Popen(cmds, cwd=root, stdout=sink,
-                            stderr=subprocess.STDOUT if sink is not None else None)
-    proc._aux_log = sink            # keep the handle alive for the process's lifetime
+    if getattr(args, 'verbose', False):
+        proc = subprocess.Popen(cmds, cwd=root, env=env)   # live on this console
+    else:
+        proc = subprocess.Popen(cmds, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        threading.Thread(target=_keep_tail, args=(proc.stdout, tail), daemon=True).start()
+    proc._aux_tail = tail
     return proc
+
+
+def _keep_tail(stream, tail):
+    """Read the worker's output as it comes (so its pipe never fills), keeping the last lines."""
+    for line in iter(stream.readline, b''):
+        tail.append(line.decode('utf-8', 'replace').rstrip())
+
+
+def show_worker_tail(proc: subprocess.Popen):
+    """Print what the worker said last, for a worker that failed. Memory only, never a file."""
+    tail = list(getattr(proc, '_aux_tail', ()))
+    if tail:
+        logger.error('last worker output:\n' + '\n'.join(tail))
 
 
 async def wait_for_worker(worker_url: str, proc: subprocess.Popen) -> bool:
@@ -129,6 +142,7 @@ async def wait_for_worker(worker_url: str, proc: subprocess.Popen) -> bool:
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 logger.error(f'local worker exited with code {proc.returncode} before becoming ready')
+                show_worker_tail(proc)
                 return False
             try:
                 async with s.get(worker_url + '/is_locked', timeout=aiohttp.ClientTimeout(total=5)) as r:
@@ -138,6 +152,7 @@ async def wait_for_worker(worker_url: str, proc: subprocess.Popen) -> bool:
                 pass
             await asyncio.sleep(2.0)
     logger.error('local worker did not become ready in time')
+    show_worker_tail(proc)
     return False
 
 
@@ -274,6 +289,7 @@ async def run(args) -> int:
         while True:
             if proc.poll() is not None:
                 logger.error(f'local worker died (code {proc.returncode}) — stopping')
+                show_worker_tail(proc)
                 return 1
             try:
                 if await session(url, hello, worker_url):

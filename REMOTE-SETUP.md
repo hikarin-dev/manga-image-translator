@@ -169,7 +169,9 @@ python server/main.py --aux --join https://translate.YOURDOMAIN.com --aux-token 
 ```
 
 The node prints one line per chunk and nothing else: no OCR/translation chatter, and never
-the `--verbose` intermediate images. Full worker output lands in `logs\aux-worker.log`.
+the `--verbose` intermediate images. Nothing the node translates is written to its disk: the
+worker keeps no log file and saves no images, and its output stays in memory, printed on the
+node's console only if the worker fails. Add `--verbose` to watch it live on screen.
 
 ### How work is shared
 
@@ -194,7 +196,9 @@ the `--verbose` intermediate images. Full worker output lands in `logs\aux-worke
 ### Trust
 
 An aux node sees every page it translates. Only give the join token to machines you'd hand
-the images to anyway. Frames coming back are deserialized through a restricted unpickler
+the images to anyway. The node keeps pages and text in memory only and drops them when the
+chunk is done; it writes none of them to disk. The operating system can still page memory out
+to its swap file (and a crash dump can hold it), which no program can rule out. Frames coming back are deserialized through a restricted unpickler
 (`server/safe_pickle.py`), so a compromised node can't execute code on the main server, but
 it can still read what it is sent.
 
