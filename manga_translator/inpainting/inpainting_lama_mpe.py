@@ -151,7 +151,9 @@ class LamaLargeInpainter(LamaMPEInpainter):
 
     _MODEL_MAPPING = {
         'model': {
-            'url': 'https://huggingface.co/dreMaz/AnimeMangaInpainting/resolve/main/lama_large_512px.ckpt',
+            # Mirrored on this project's release: the upstream Hugging Face copy
+            # (dreMaz/AnimeMangaInpainting) can crawl at a few KB/s. Same file, same hash.
+            'url': 'https://github.com/hikarin-dev/manga-image-translator/releases/download/runtime-v2/lama_large_512px.ckpt',
             'hash': '11d30fbb3000fb2eceae318b75d9ced9229d99ae990a7f8b3ac35c8d31f2c935',
             'file': '.',
         },
