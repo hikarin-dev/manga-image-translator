@@ -8,10 +8,9 @@ REM
 REM Fill in the two values below (the server's operator gives you both), then
 REM just run this file. Leave the window open; close it to stop.
 REM
-REM The console stays quiet: one line per chunk. Nothing you translate for the
-REM server is written to this disk: no images, no logs with its text. The
-REM worker's output is kept in memory and shown here only if it fails. Add
-REM --verbose to the command below to watch the worker live (still never saved).
+REM The console only says when a chunk arrives, finishes or fails. Nothing about
+REM the pages you translate for the server is shown or written to this disk: no
+REM images, no text, no logs of it. --verbose has no effect on a node.
 
 cd /d "%~dp0"
 

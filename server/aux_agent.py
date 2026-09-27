@@ -43,7 +43,7 @@ MAX_MESSAGE_BYTES = 256 * 1024 * 1024
 RECONNECT_MIN_S = 2.0
 RECONNECT_MAX_S = 30.0
 WORKER_READY_TIMEOUT_S = 900.0
-WORKER_TAIL_LINES = 200   # the worker's last output lines, kept in memory for a failure report
+WORKER_TAIL_LINES = 200   # the worker's startup output, kept in memory for a failure report
 
 
 def join_url(base: str) -> str:
@@ -84,14 +84,14 @@ def spawn_worker(port: int, args) -> subprocess.Popen:
     own worker, minus the executor registration — here the agent is the only caller.
 
     An aux node is somebody's spare desktop lending its GPU, and the pages it translates belong
-    to someone else, so nothing of them may reach its disk:
+    to someone else, so nothing of them may reach its disk or its screen:
 
       * the worker runs with MT_EPHEMERAL=1: no log file under result/ (it records every source
         text, translation and LLM prompt) and no --verbose stage images, whatever flags it gets.
-      * the worker's own stdout/stderr (model loading, per-page OCR, translation chatter) is
-        kept in memory, its last WORKER_TAIL_LINES lines only, and printed here if the worker
-        fails. Pass --verbose to the AGENT to watch it live on this console instead; that is
-        still never written to disk.
+      * the worker's own stdout/stderr never reaches this console. Until it is ready (model
+        loading, before any job) its last WORKER_TAIL_LINES lines are kept in memory and
+        printed if it fails to start; from then on its output is read and dropped.
+      * --verbose has no effect on a node.
     """
     cmds = [sys.executable, '-m', 'manga_translator', 'shared',
             '--host', '127.0.0.1', '--port', str(port), '--nonce', 'None']
@@ -111,27 +111,34 @@ def spawn_worker(port: int, args) -> subprocess.Popen:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env = dict(os.environ, MT_EPHEMERAL='1')
     tail = collections.deque(maxlen=WORKER_TAIL_LINES)
+    starting = threading.Event()
+    starting.set()
     logger.info(f'starting local worker on 127.0.0.1:{port}')
-    if getattr(args, 'verbose', False):
-        proc = subprocess.Popen(cmds, cwd=root, env=env)   # live on this console
-    else:
-        proc = subprocess.Popen(cmds, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        threading.Thread(target=_keep_tail, args=(proc.stdout, tail), daemon=True).start()
-    proc._aux_tail = tail
+    proc = subprocess.Popen(cmds, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    threading.Thread(target=_keep_tail, args=(proc.stdout, tail, starting), daemon=True).start()
+    proc._aux_tail, proc._aux_starting = tail, starting
     return proc
 
 
-def _keep_tail(stream, tail):
-    """Read the worker's output as it comes (so its pipe never fills), keeping the last lines."""
+def _keep_tail(stream, tail, starting):
+    """Read the worker's output as it comes, so its pipe never fills. Lines are kept only while
+    the worker is starting; once it serves jobs they are dropped unread."""
     for line in iter(stream.readline, b''):
-        tail.append(line.decode('utf-8', 'replace').rstrip())
+        if starting.is_set():
+            tail.append(line.decode('utf-8', 'replace').rstrip())
+
+
+def worker_started(proc: subprocess.Popen):
+    """The worker is ready: forget its startup output and keep none from here on."""
+    proc._aux_starting.clear()
+    proc._aux_tail.clear()
 
 
 def show_worker_tail(proc: subprocess.Popen):
-    """Print what the worker said last, for a worker that failed. Memory only, never a file."""
+    """Print the startup output of a worker that failed to start. It has seen no job yet."""
     tail = list(getattr(proc, '_aux_tail', ()))
     if tail:
-        logger.error('last worker output:\n' + '\n'.join(tail))
+        logger.error('worker startup output:\n' + '\n'.join(tail))
 
 
 async def wait_for_worker(worker_url: str, proc: subprocess.Popen) -> bool:
@@ -183,7 +190,7 @@ class _Relay:
         token = self.jobs.get(cid)
         if token is None:
             return
-        logger.info(f'chunk {cid}: cancel requested')
+        logger.info(f'chunk {cid}: cancelled')
         from server.sent_data_internal import post_cancel
         await post_cancel(self.worker_url + '/cancel_gallery', token)
 
@@ -195,9 +202,7 @@ class _Relay:
         try:
             attrs = pickle.loads(payload)
             self.jobs[cid] = attrs.get('job_token', '')
-            pages = len(attrs.get('images') or [])
-            logger.info(f'chunk {cid}: {pages} page(s) received, dispatching to local worker')
-            started = time.monotonic()
+            logger.info(f'chunk {cid}: received')
             await fetch_gallery_stream(
                 self.worker_url + '/execute/translate_gallery_stream',
                 attrs['images'], attrs['config'],
@@ -205,10 +210,12 @@ class _Relay:
                 attrs.get('batch_size', 0), attrs.get('job_token', ''),
                 pages=attrs.get('pages'), builds=attrs.get('builds'), context=attrs.get('context'),
                 capture=attrs.get('capture', True))
-            logger.info(f'chunk {cid}: done in {time.monotonic() - started:.1f}s')
+            logger.info(f'chunk {cid}: finished')
         except Exception as e:
+            # The main server gets the details; this console only the outcome, since an error
+            # message can quote the page's own text.
             error = str(e) or e.__class__.__name__
-            logger.error(f'chunk {cid}: failed — {error}')
+            logger.error(f'chunk {cid}: failed')
         finally:
             await frames.put(None)        # drain sentinel: every frame is sent before 'end'
             try:
@@ -218,7 +225,7 @@ class _Relay:
                 # here would make the main server see a chunk that "ended early" for no stated
                 # reason, and retry it blind.
                 error = error or f'failed to forward frames: {e}'
-                logger.error(f'chunk {cid}: {error}')
+                logger.error(f'chunk {cid}: failed to return its pages')
             self.jobs.pop(cid, None)
             self.tasks.pop(cid, None)
         try:
@@ -285,11 +292,11 @@ async def run(args) -> int:
         logger.info(f'local worker ready; joining {url} as "{hello["name"]}" '
                     f'(version {hello["version"]}, caps {hello["caps"]})')
 
+        worker_started(proc)
         backoff = RECONNECT_MIN_S
         while True:
             if proc.poll() is not None:
-                logger.error(f'local worker died (code {proc.returncode}) — stopping')
-                show_worker_tail(proc)
+                logger.error(f'local worker stopped (exit code {proc.returncode}) — stopping')
                 return 1
             try:
                 if await session(url, hello, worker_url):

@@ -168,10 +168,12 @@ repeat verbatim for every extra machine. Equivalent by hand:
 python server/main.py --aux --join https://translate.YOURDOMAIN.com --aux-token <secret> --use-gpu
 ```
 
-The node prints one line per chunk and nothing else: no OCR/translation chatter, and never
-the `--verbose` intermediate images. Nothing the node translates is written to its disk: the
-worker keeps no log file and saves no images, and its output stays in memory, printed on the
-node's console only if the worker fails. Add `--verbose` to watch it live on screen.
+The node's console only says when a chunk arrives, finishes or fails. Nothing about the
+pages it translates is shown or written to its disk: no images, no source text or
+translations, no logs of them. The worker's own output is discarded; only its startup
+messages (model loading, before it has seen any job) are shown, and only if it fails to
+start. Error details go to the main server, not the node's console. `--verbose` has no effect
+on a node.
 
 ### How work is shared
 

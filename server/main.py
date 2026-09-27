@@ -773,6 +773,8 @@ if __name__ == '__main__':
         # the relay that feeds it from the main server. Exits non-zero on a fatal join refusal
         # (bad token / protocol / version) so a supervisor doesn't loop on it forever.
         from server import aux_agent
+        if args.verbose:
+            print('--verbose has no effect on an aux node: it shows nothing about the jobs it runs.')
         sys.exit(asyncio.run(aux_agent.run(args)))
 
     args.start_instance = True

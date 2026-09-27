@@ -1,5 +1,9 @@
-"""An aux node writes nothing of the pages it translates to its disk."""
+"""An aux node keeps the pages it translates private: nothing of them on its disk or its screen."""
+import asyncio
 import io
+import json
+import logging
+import pickle
 import subprocess
 from types import SimpleNamespace
 
@@ -8,26 +12,58 @@ from manga_translator.manga_translator import MangaTranslator
 from server import aux_agent
 
 
-def test_the_node_worker_is_ephemeral_and_its_output_stays_in_memory(monkeypatch):
+def spawn(monkeypatch, **args):
     started = {}
 
     class FakeProc:
         def __init__(self, cmds, **kwargs):
             started.update(kwargs, cmds=cmds)
-            self.stdout = io.BytesIO(b'loading models\nready\n')
+            self.stdout = io.BytesIO(b'loading models\n')
     monkeypatch.setattr(aux_agent.subprocess, 'Popen', FakeProc)
-    proc = aux_agent.spawn_worker(5099, SimpleNamespace(verbose=False, use_gpu=True))
-    assert started['env']['MT_EPHEMERAL'] == '1'
-    assert started['stdout'] is subprocess.PIPE and started['stderr'] is subprocess.STDOUT
-    assert '--verbose' not in started['cmds']
-    aux_agent._keep_tail(proc.stdout, proc._aux_tail)
-    assert list(proc._aux_tail) == ['loading models', 'ready']
+    monkeypatch.setattr(aux_agent.threading, 'Thread', lambda **kw: SimpleNamespace(start=lambda: None))
+    return aux_agent.spawn_worker(5099, SimpleNamespace(use_gpu=True, **args)), started
 
 
-def test_only_the_last_lines_are_kept():
-    tail = aux_agent.collections.deque(maxlen=aux_agent.WORKER_TAIL_LINES)
-    aux_agent._keep_tail(io.BytesIO(b''.join(b'line %d\n' % i for i in range(500))), tail)
-    assert len(tail) == aux_agent.WORKER_TAIL_LINES and tail[-1] == 'line 499'
+def test_the_worker_is_ephemeral_and_never_writes_to_this_console(monkeypatch):
+    for verbose in (False, True):
+        _, started = spawn(monkeypatch, verbose=verbose)
+        assert started['env']['MT_EPHEMERAL'] == '1'
+        assert started['stdout'] is subprocess.PIPE and started['stderr'] is subprocess.STDOUT
+        assert '--verbose' not in started['cmds']
+
+
+def test_worker_output_is_kept_only_while_it_starts(monkeypatch):
+    proc, _ = spawn(monkeypatch, verbose=False)
+    aux_agent._keep_tail(io.BytesIO(b'loading models\n'), proc._aux_tail, proc._aux_starting)
+    assert list(proc._aux_tail) == ['loading models']
+    aux_agent.worker_started(proc)
+    aux_agent._keep_tail(io.BytesIO('原文 => translation\n'.encode()), proc._aux_tail, proc._aux_starting)
+    assert list(proc._aux_tail) == []
+
+
+def test_a_failed_chunk_reports_its_error_to_the_server_but_not_to_this_console(monkeypatch):
+    lines = []
+    handler = logging.Handler()
+    handler.emit = lambda record: lines.append(record.getMessage())
+    aux_agent.logger.addHandler(handler)
+    sent = []
+
+    class Ws:
+        async def send(self, message):
+            sent.append(message)
+
+    async def fetch(*args, **kwargs):
+        raise RuntimeError('OCR failed on 秘密のセリフ')
+    import server.sent_data_internal as sdi
+    monkeypatch.setattr(sdi, 'fetch_gallery_stream', fetch)
+    try:
+        relay = aux_agent._Relay(Ws(), 'http://127.0.0.1:1')
+        payload = pickle.dumps({'images': [b'page'], 'config': None, 'job_token': 't'})
+        asyncio.run(relay._run(1, payload))
+    finally:
+        aux_agent.logger.removeHandler(handler)
+    assert lines == ['chunk 1: received', 'chunk 1: failed']
+    assert '秘密のセリフ' in json.loads(sent[-1])['error']
 
 
 def test_an_ephemeral_worker_keeps_no_log_file_and_no_stage_images(monkeypatch):
