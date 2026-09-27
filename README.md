@@ -33,8 +33,8 @@ this section is the upstream project's documentation.
 - **Python 3.11** from [python.org](https://www.python.org/downloads/). 3.10 and 3.12 also work;
   3.13 doesn't (`numpy 1.26` has no wheels for it). Tick "Add python.exe to PATH" while installing.
 - **Git** from [git-scm.com](https://git-scm.com/download/win).
-- **About 20 GB of free disk space**: roughly 8 GB for the Python environment and up to 8 GB
-  for the AI models, which download on first use.
+- **About 20 GB of free disk space**: roughly 9 GB for the Python environment and 4 to 8 GB
+  for the AI models, depending on which ones you use. They download on first use.
 
 ### 1. Get the code
 
@@ -145,6 +145,7 @@ We only test on Windows.
 | `torch.cuda.is_available()` is `False` | A CPU-only PyTorch got installed. Repeat step 2 with `--force-reinstall --no-deps`. |
 | CUDA out of memory | The server caps PyTorch at half of your VRAM. On a small card, raise that in `.env`, for example `MT_CUDA_MEMORY_FRACTION=0.8`. |
 | Port 5003 already in use | Run `stop-translator.bat`, or close the other server window. |
+| A model download crawls or stops | Some models come from Hugging Face, which is sometimes slow. Downloads resume where they stopped: restart the server and translate again. |
 
 More setup notes (other translators, OCR options, renderers): [SHIORI-SETUP.md](SHIORI-SETUP.md).
 Exposing the server to other people: [REMOTE-SETUP.md](REMOTE-SETUP.md).
