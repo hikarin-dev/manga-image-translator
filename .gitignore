@@ -68,8 +68,15 @@ shiori-renderer/**/target/
 # finished job INCLUDING the client IP, so this is privacy-relevant, not just noise.
 logs/
 upload-cache/
+snapshots/
+feedback/
 *.log
 *.jsonl
+
+# Local benchmark reports (devscripts/pipeline_harness.py writes one here by default) and
+# interrupted model downloads
+harness-report*.json
+*.part
 
 # Test and tooling caches
 .pytest_cache/

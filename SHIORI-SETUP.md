@@ -13,7 +13,10 @@ without a window (orphaned process), run **`stop-translator.bat`** to free ports
 
 - API: `http://127.0.0.1:5003`  (set this in Shiori → Settings → Translation)
 - GPU worker: auto-spawned on `127.0.0.1:5004`
-- Runs on the RTX 3070 via CUDA (torch cu124).
+- Runs on the GPU via CUDA. PyTorch is installed per machine, in the build that matches
+  the GPU (README, "Install from scratch", step 2). Blackwell GPUs (RTX 50-series) need a
+  CUDA 12.8+ build: the older wheels fail with "no kernel image is available for execution
+  on the device".
 
 ## Shiori settings
 - **Translation server:** `http://127.0.0.1:5003`
@@ -128,6 +131,34 @@ color head, GPU). First use downloads ~140 MB (`encoder_int8.tflite`,
 `decoder_cache_fp16.tflite`, `mocr2025_vocab.csv`) into `models/ocr/`,
 sha256-verified. Implementation: `manga_translator/ocr/model_manga_ocr_tflite.py`.
 
+## OCR `hayai` (Hayai OCR v2.5 "Nova")
+
+Text from HuggingFace `JustANormalTinkerer/hayai-ocr-v2.5-nova` (Apache-2.0),
+a manga-ocr fork: SigLIP2 NaFlex encoder that keeps each crop's aspect ratio
+(no squash to 224²) + 12-layer GQA decoder, trained on Manga109-s, AnimeText,
+COO onomatopoeia and synthetic data. Upstream reports JMangaBench_Mixed exact
+match 80.7% vs manga-ocr's 73.5% (CER 3.10% vs 4.68%) at the 512-patch budget
+used here. Furigana is skipped like manga-ocr does. Runs on GPU (fp16 autocast)
+in batches of 16.
+
+The upstream remote code needs transformers ≥ 4.49 (`Siglip2VisionModel`),
+which this venv can't take (4.46.3 pin), so `manga_translator/ocr/hayai_nova.py`
+is a self-contained torch port: SigLIP2 vision tower + NaFlex processor ported
+from transformers 5.17 with upstream parameter names, and the upstream decoder
+verbatim except batched generation masks zero-padded vision tokens (upstream
+lets shorter crops in a batch attend to padding, so their text could depend on
+batch-mates). Verified against the official `hayai-ocr` library (transformers
+5.17) on 37 crops: preprocessing tensors bit-identical, text identical on
+CPU fp32 and on GPU fp16, and batched == one-at-a-time.
+
+Region handling and prob/font colors are inherited from `mocr_fast` (48px CTC
+color head). Text still goes through manga-ocr's `post_process` (full-width,
+no whitespace) so downstream sees the same format. First use downloads ~630 MB
+(`hayai-nova.safetensors`, `hayai-nova-tokenizer.json`) into `models/ocr/` from a
+pinned HF revision, sha256-verified. Implementation:
+`manga_translator/ocr/model_hayai.py`. Background and alternatives:
+`shiori/plans/ocr-candidates.md`.
+
 ## Balloon-aware rendering (`manga2eng`)
 
 The `manga2eng` renderer lays text out against a balloon mask. That mask used to
@@ -171,8 +202,8 @@ options, so the fit stays feasible, and the demerit penalties do the phrase
 binding the chunks used to. The chunk list survives *only* for the centred
 `layout_lines_aligncenter` fallback (used when text can't fit even at the floor,
 or for untrusted contour masks), which has no demerit machinery and leans on
-gluing as its sole orphan guard. Reaches manga2eng and the shiori_v2 hybrid (its
-balloon regions route through this fit); shiori v1's Rust engine is untouched. The block is always centred on the
+gluing as its sole orphan guard. This fit applies to manga2eng; both Shiori modes
+use the native Koharu layout engine. The block is always centred on the
 balloon's rows (2026-07-19): the fit only accepts a k-line block that actually
 uses all k lines (greedy finishing early used to leave the block riding high in
 a taller block — the search now settles a notch smaller instead), and the
@@ -196,13 +227,14 @@ balloon, its padded inner boundary (thin line), the drawn text rect, font px and
 fit %. In gallery runs the dump is routed through each page's own result folder,
 so every rendered page gets its `bubbles.png`.
 
-**Requires a one-time model export** (~11 MB) — without it the code logs a warning
-and silently uses the contour fallback:
+**The model (~11 MB) downloads on first use** from this project's `runtime-v2` release,
+checksum-verified, to:
 
 ```
 models/bubble_seg/manga109_yolo11n_seg.onnx
 ```
-YOLO11n-seg trained on Manga109 + MS92/MangaSegmentation, from
+If that fails, the code logs a warning and silently uses the contour fallback.
+It is YOLO11n-seg trained on Manga109 + MS92/MangaSegmentation, from
 https://huggingface.co/huyvux3005/manga109-segmentation-bubble (`best.pt`).
 The HF repo only hosts the PyTorch checkpoint; export it with ultralytics
 (installed in the venv with `--no-deps` plus onnx/py-cpuinfo/ultralytics-thop/
@@ -224,53 +256,55 @@ Implementation: `manga_translator/rendering/bubble_seg.py`. Note the exported
 ONNX carries Ultralytics' AGPL-3.0 in its metadata, not the Apache-2.0 on the
 model card — relevant only because the server is exposed publicly.
 
-## Shiori renderer (`render.renderer: "shiori"`) — koharu engine
+## Shiori renderer (`render.renderer: "shiori"`)
 
-A second, fully independent English renderer built on [koharu](https://github.com/mayocream/koharu)'s
-text engine (GPL-3.0). Completely isolated from `text_render_eng.py` — selecting
-`"shiori"` as the renderer touches none of the manga2eng code paths.
+The **shiori** option uses Koharu's current scene renderer and Vello GPU rasterizer,
+pinned to commit `4a133539f204ab1182ff64901ba5226b4e868fb0` (upstream 0.83.4).
+It replaces the old bubble-fit driver and YuzuMarker style model. Joined balloons
+retain their individual text anchors and use upstream's physical contour division;
+free text keeps upstream's conservative 24 px automatic maximum.
 
-**Layout/rendering (Rust, `shiori-renderer/`):**
-- `vendor/koharu-renderer/` — koharu v0.61.2's renderer crate, **byte-identical
-  vendored sources** (harfrust shaping, skrifa metrics, fontdue+tiny-skia raster,
-  hypher hyphenation, ICU segmentation, Knuth-Plass-style DP line breaking).
-- `src/driver.rs` — faithful port of `koharu-app/src/renderer.rs` (the render
-  driver: bubble-ID mask → per-block layout-box expansion, binary-search font
-  fit with pixel-level mask-collision checks, stroke/text color resolution).
-  Deviations are marked `[shiori]`: Google-Fonts service removed (fonts come
-  from the system + registered files), `NodeId` is a caller index, fitted font
-  size reported back. All 13 upstream driver tests ported and passing.
-- `src/lib.rs` — PyO3 bindings (`shiori_renderer` abi3 wheel, installed in the
-  venv). Rebuild: `PATH="$HOME/.cargo/bin:$PATH" ../venv/Scripts/maturin.exe
-  build --release -o dist` then `pip install --force-reinstall dist/*.whl`
-  (rustup lives at `~/.cargo`, installed with `--no-modify-path`).
+Upstream owns fitting, language-aware breaking/hyphenation, CJK/RTL shaping,
+font fallback/styles, outlines, rotation, and rasterization. Its pixel-based
+typography inference supplies fill, stroke, angle, and source direction. Shiori
+supplies its existing OCR, translations, segmentation masks, selected font file,
+and inpainted background. Those inputs may differ from Koharu's full pipeline.
 
-**Colors/style (Python, independent of OCR):**
-- `manga_translator/rendering/shiori_style.py` — koharu's YuzuMarker font
-  detector (ResNet-50, weights auto-download from
-  `fffonion/yuzumarker-font-detection` to `models/shiori/`). Per region-crop of
-  the SOURCE page it regresses text RGB, stroke RGB, stroke width, direction,
-  size, angle, plus koharu's normalization (near-black/white clamping; stroke
-  suppressed when text≈stroke color). Faithful to koharu except: torchvision
-  maxpool keeps padding=1 (candle can't pad; the weights were trained with it)
-  and inference is fp32.
-- Color policy (koharu's, in the driver): predicted text color used directly;
-  stroke uses the predicted width but an auto-contrast black/white color.
-- `manga_translator/rendering/shiori_render.py` — glue: detection boxes as seed
-  transforms, `bubble_seg` masks → grayscale bubble-ID mask, predictions per
-  block, CC Victory Speech registered as the document font.
+See [shiori-renderer/UPSTREAM.md](shiori-renderer/UPSTREAM.md) for the exact port
+boundary, licenses, local capture patches, build commands, and reproducible pixel
+comparison. A compatible wgpu/Vello GPU is required. Rebuild/install the native
+wheel and restart loaded workers; the adapter rejects the incompatible old wheel.
+The requirements file no longer installs the incompatible old release wheel;
+install the optional renderer from local source (Rust required).
 
-Select with `render.renderer: "shiori"` in the request config. Blocks keep
-koharu semantics: text expands into its balloon (single-tenant balloons only),
-centre-aligned, hyphenated, capped at 72 px / floored at a size derived from
-page dimensions.
+Feedback snapshots preserve upstream's chosen lines, geometry, actual fonts,
+colors, and fitting inputs. Study hints use the actual rendered lines and bounds.
+Shiori adds a white outline of at least 1.5 page pixels to black/near-black text for
+manga readability. Explicit outline colors and the border-disable setting take
+precedence. This paint policy also applies to selectable text; upstream fitting
+and line breaking remain unchanged.
 
-The driver reports the colors each block was ACTUALLY drawn with (text +
-resolved stroke; stroke color == text color and width 0 when no stroke was
-drawn). The glue stores them as `region._drawn_fg/_drawn_bg`, and the study
-payload's single `style.fg`/`style.bg` pair prefers them over OCR colors —
-both the original and the translation DOM text share that one pair, so study
-text always matches the render.
+### Shiori hybrid (`render.renderer: "shiori_v2"`)
+
+The existing hybrid option now uses Shiori layout for every region: balloon and
+conjoined-lobe fitting, position, automatic font size, line breaks, CJK/RTL shaping,
+and free-text behavior. It takes fill and outline colors from the same
+`TextBlock.get_font_colors()` path as manga2eng, including OCR/page color estimates,
+saturation, and low-contrast background correction. Manual color and border-disable
+settings remain available.
+
+After native layout chooses the size, the hybrid uses manga2eng's actual glyph
+stroke radius: `max(int(0.07 * int(font_size)), 1)` pixels when its
+`int(int(font_size) * 0.1)` border gate is positive, otherwise zero. The 10% value
+is layout padding in manga2eng, not the visible radius. Shiori's 1.5 px white-halo
+minimum does not replace this hybrid policy. Native layout is measured without
+rasterizing, then the same automatic layout is drawn with the resolved paint.
+
+Feedback records the hybrid renderer ID, paint policy, final block colors and
+widths, native layout, and fonts. Selectable text honors that recorded paint and
+keeps Shiori's original letter case. The native `layout_page` API requires rebuilding
+and reinstalling the wheel, then restarting workers. Existing `shiori_v2` settings
+select the rewritten hybrid; saved images must be rerendered to change their paint.
 
 ## Post-OCR color override (`render.estimate_font_color` / `estimate_outline_color`)
 
@@ -316,5 +350,6 @@ consensus among pink text also repairs isolated mask outliers. Forced
   rendering" above.
 
 ## Python env
-Dedicated venv at `.\venv` (Python 3.11.9). To reinstall deps:
+Dedicated venv at `.\venv` (Python 3.11.9). Install PyTorch for the GPU first, then the
+rest; see README, "Install from scratch". To reinstall deps:
 `venv\Scripts\python.exe -m pip install -r requirements.txt`

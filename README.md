@@ -20,6 +20,135 @@ This project is v2 of [Qiú wén zhuǎn yì zhì](https://github.com/PatchyVideo
 **Note: This project is still in the early stages of development and has many shortcomings. We need your help to improve it!**
 
 
+## Shiori translation server: install from scratch
+
+This fork is the translation server behind [Shiori](https://github.com/hikarin-dev/shiori)'s
+Translate feature. These steps take a fresh Windows PC to a running server. Everything below
+this section is the upstream project's documentation.
+
+### What you need
+
+- **Windows 10 or 11, 64-bit.** For other systems, see [Other platforms](#other-platforms).
+- **An NVIDIA GPU** with an up-to-date driver. It runs on the CPU as well, but many times slower.
+- **Python 3.11** from [python.org](https://www.python.org/downloads/). 3.10 and 3.12 also work;
+  3.13 doesn't (`numpy 1.26` has no wheels for it). Tick "Add python.exe to PATH" while installing.
+- **Git** from [git-scm.com](https://git-scm.com/download/win).
+- **About 20 GB of free disk space**: roughly 8 GB for the Python environment and up to 8 GB
+  for the AI models, which download on first use.
+
+### 1. Get the code
+
+Open a terminal (PowerShell or Command Prompt) in the folder you want the server in:
+
+```bat
+git clone https://github.com/hikarin-dev/manga-image-translator.git
+cd manga-image-translator
+py -3.11 -m venv venv
+venv\Scripts\activate
+python -m pip install --upgrade pip
+```
+
+Keep this terminal open for the next steps. If you close it, `cd` back into the folder and run
+`venv\Scripts\activate` again.
+
+### 2. Install PyTorch for your GPU
+
+PyTorch comes in a separate build per CUDA version, and the right one depends on your GPU and
+driver, so it isn't in `requirements.txt`. The server is tested with **torch 2.8.0** and
+**torchvision 0.23.0**.
+
+Run `nvidia-smi` and read **CUDA Version** in the top right corner, then install the matching build:
+
+| `nvidia-smi` shows | Install |
+|---|---|
+| 12.8 or higher (**RTX 50-series needs this**) | `pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128` |
+| 12.6 or 12.7 | `pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu126` |
+| lower than 12.6 | update your NVIDIA driver first, then use the rows above |
+| no NVIDIA GPU | `pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu` |
+
+Other combinations are listed on [pytorch.org](https://pytorch.org/get-started/locally/).
+
+### 3. Install everything else
+
+```bat
+pip install -r requirements.txt
+```
+
+This keeps the PyTorch build from step 2. It also installs the shiori renderer (a prebuilt wheel
+from this project's [release](https://github.com/hikarin-dev/manga-image-translator/releases/tag/runtime-v2)).
+
+Check that PyTorch sees your GPU:
+
+```bat
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+It should print something like `2.8.0+cu128 True`. If it prints `+cpu` or `False`, repeat
+step 2 with `--force-reinstall --no-deps` added.
+
+### 4. Add API keys (optional)
+
+Offline translators such as **Sugoi** need no key. For online ones, copy
+`examples\Example.env` to `.env` in this folder and fill in the key of the service you use,
+for example `DEEPSEEK_API_KEY=...` for DeepSeek. `.env` stays on your machine; it's never
+committed.
+
+### 5. Start the server
+
+Double-click **`start-translator.bat`**, or run it from the terminal. The API listens on
+`http://127.0.0.1:5003`.
+
+- The **first run downloads the AI models** into `models\`. That takes a while and needs an
+  internet connection; later starts only load them.
+- Leave the window open while you translate. Close it (or press Ctrl+C) to stop.
+- If the server was left running without a window, `stop-translator.bat` frees its ports
+  (5003 and 5004).
+
+### 6. Connect Shiori
+
+In Shiori, open **Settings → Translation**. The **Translation server** field defaults to
+`http://127.0.0.1:5003`, so a server on the same PC needs no change. Pick a translator and
+translate a gallery.
+
+### Updating
+
+```bat
+git pull
+venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Then restart the server. When the renderer changes, `requirements.txt` points at a new wheel
+and this step installs it.
+
+### Other platforms
+
+The steps are the same, with these differences:
+
+- activate the environment with `source venv/bin/activate`;
+- start the server with `MT_WEB_NONCE=None python server/main.py --host 127.0.0.1 --port 5003 --use-gpu --context-size 4 --models-ttl 300`;
+- the prebuilt renderer is Windows x64 only, so pip skips it. Build it from source; this needs
+  [Rust](https://rustup.rs/):
+
+  ```bash
+  pip install maturin
+  cd shiori-renderer && maturin build --release -o dist && pip install dist/*.whl
+  ```
+
+We only test on Windows.
+
+### Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `no kernel image is available for execution on the device` | Your PyTorch build is too old for your GPU. Repeat step 2 with the cu128 build and `--force-reinstall --no-deps`. |
+| `torch.cuda.is_available()` is `False` | A CPU-only PyTorch got installed. Repeat step 2 with `--force-reinstall --no-deps`. |
+| CUDA out of memory | The server caps PyTorch at half of your VRAM. On a small card, raise that in `.env`, for example `MT_CUDA_MEMORY_FRACTION=0.8`. |
+| Port 5003 already in use | Run `stop-translator.bat`, or close the other server window. |
+
+More setup notes (other translators, OCR options, renderers): [SHIORI-SETUP.md](SHIORI-SETUP.md).
+Exposing the server to other people: [REMOTE-SETUP.md](REMOTE-SETUP.md).
+
 ## 📂 Directory
 
 *   [Showcase](#showcase)

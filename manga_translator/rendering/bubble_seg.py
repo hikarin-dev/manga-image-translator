@@ -19,6 +19,11 @@ from ..utils import BASE_PATH, get_logger
 logger = get_logger('bubble_seg')
 
 MODEL_PATH = os.path.join(BASE_PATH, 'models', 'bubble_seg', 'manga109_yolo11n_seg.onnx')
+# Not in the repository: fetched once from this project's release on first use, like the
+# other models.
+MODEL_URL = ('https://github.com/hikarin-dev/manga-image-translator/releases/download/'
+             'runtime-v2/manga109_yolo11n_seg.onnx')
+MODEL_SHA256 = '4c0c986888f743c65c0108917301bf2faaaee40b37950a9eda9a16f3940619a8'
 
 # Trained at 1600 with stride 32 (huyvux3005/manga109-segmentation-bubble).
 INPUT_SIZE = 1600
@@ -29,6 +34,24 @@ MASK_THRESHOLD = 0.5
 _session = None
 _session_lock = threading.Lock()
 _unavailable = False
+
+
+def _fetch_model() -> bool:
+    """Download the weights to MODEL_PATH, checksum-verified. False when that fails."""
+    from ..utils.generic import download_url_with_progressbar, get_digest
+    part = MODEL_PATH + '.part'
+    try:
+        os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+        logger.info('downloading the speech-balloon segmentation model')
+        download_url_with_progressbar(MODEL_URL, part)
+        if get_digest(part) != MODEL_SHA256:
+            os.remove(part)
+            raise ValueError('checksum mismatch')
+        os.replace(part, MODEL_PATH)
+        return True
+    except Exception as e:
+        logger.warning(f'could not download the bubble segmentation model ({e})')
+        return False
 
 
 def _get_session():
@@ -46,7 +69,7 @@ def _get_session():
             logger.info('bubble segmentation disabled via MT_BUBBLE_SEG=0; using contour fallback')
             _unavailable = True
             return None
-        if not os.path.isfile(MODEL_PATH):
+        if not os.path.isfile(MODEL_PATH) and not _fetch_model():
             logger.warning(f'bubble segmentation model not found at {MODEL_PATH}; using contour fallback')
             _unavailable = True
             return None
