@@ -16,9 +16,9 @@ is upstream `modeling_hayai.py` with two deliberate deviations, marked [shiori]:
   - on CUDA the decode steps replay as captured CUDA graphs (_DecodeGraph).
 '''
 
+import logging
 import math
 import os
-import warnings
 from collections import OrderedDict
 from functools import lru_cache
 from typing import List, Tuple
@@ -478,7 +478,7 @@ class _DecodeGraph:
     step computes what the eager loop computes; attending over the fixed length (masked) instead
     of the written prefix can round differently in the last bits.'''
 
-    GRAPHS_KEPT = 16
+    GRAPHS_KEPT = 8
 
     def __init__(self, model, batch, length, dtype, device, max_new_tokens, eos_id, pad_id):
         attn = model.decoder.layers[0].attn
@@ -534,20 +534,30 @@ class _DecodeGraph:
         self.mask[:b, 0, 0, :].masked_fill_(slots[None, :] < valid_vis[:, None], 0.0)
         self.mask[:b, 0, 0, m_vision] = 0.0     # the bos token
         if self.graph is None:
-            saved = [t.clone() for t in (self.tok, self.unfinished, self.pos, self.idx, self.mask)]
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):          # warm-up before capture, as CUDA graphs require
-                for _ in range(2):
-                    self._step()
-            torch.cuda.current_stream().wait_stream(side)
-            for t, value in zip((self.tok, self.unfinished, self.pos, self.idx, self.mask), saved):
-                t.copy_(value)                     # slots the warm-up wrote are rewritten before read
-            graph = torch.cuda.CUDAGraph()
-            # thread_local: the other GPU lanes keep launching work while this lane captures.
-            with torch.cuda.graph(graph, capture_error_mode='thread_local'):
+            self._capture()
+
+    def _capture(self):
+        saved = [t.clone() for t in (self.tok, self.unfinished, self.pos, self.idx, self.mask)]
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):          # warm-up before capture, as CUDA graphs require
+            for _ in range(2):
                 self._step()
-            self.graph = graph
+        torch.cuda.current_stream().wait_stream(side)
+        for t, value in zip((self.tok, self.unfinished, self.pos, self.idx, self.mask), saved):
+            t.copy_(value)                     # slots the warm-up wrote are rewritten before read
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        # Captured by hand, not with torch.cuda.graph(): when a capture fails, that context manager
+        # leaves the capture stream current on this thread, and the eager fallback then fails too.
+        # thread_local: the other GPU lanes keep launching work while this lane captures.
+        with torch.cuda.stream(torch.cuda.Stream()):
+            graph.capture_begin(capture_error_mode='thread_local')
+            try:
+                self._step()
+            finally:
+                graph.capture_end()
+        self.graph = graph
 
     def decode(self, generated_tokens, max_new_tokens):
         b = generated_tokens.size(0)
@@ -568,20 +578,39 @@ class HayaiModel(nn.Module):
         # [shiori] CUDA-graph decoding (_DecodeGraph); MT_HAYAI_GRAPHS=0 turns it off.
         self.graphed_decode = os.environ.get('MT_HAYAI_GRAPHS', '1') != '0'
         self._graphs = OrderedDict()
+        self._capture_failures = 0
 
-    def _decode_graph(self, b, m_vision, max_new_tokens, dtype, device, eos_id, pad_id):
-        '''The graph for this batch, padded to a power of two, and cache length, bucketed by 64.'''
+    CAPTURE_TRIES = 3
+
+    def _decode_graph(self, b, m_vision, max_new_tokens, device, eos_id, pad_id):
+        '''The graph for this batch, padded to a power of two, and cache length, bucketed by 64.
+        Its cache is fp16: attention reads the cache as fp16 under autocast anyway, so storing it
+        rounded is bit-identical and takes half the memory.'''
         batch = 1 << (b - 1).bit_length()
         length = -(-(m_vision + 1) // 64) * 64 + max_new_tokens
-        key = (batch, length, dtype, max_new_tokens, eos_id, pad_id)
+        key = (batch, length, max_new_tokens, eos_id, pad_id)
         graph = self._graphs.get(key)
         if graph is None:
-            graph = self._graphs[key] = _DecodeGraph(self, batch, length, dtype, device, max_new_tokens,
-                                                     eos_id, pad_id)
+            graph = self._graphs[key] = _DecodeGraph(self, batch, length, torch.float16, device,
+                                                     max_new_tokens, eos_id, pad_id)
             while len(self._graphs) > _DecodeGraph.GRAPHS_KEPT:
                 self._graphs.popitem(last=False)
         self._graphs.move_to_end(key)
         return graph
+
+    def _capture_failed(self, graph, error):
+        '''A capture fails when something else on the GPU interrupts it (another lane freeing
+        cached memory, say). This page decodes eagerly; the graph is captured afresh on a later
+        call, and after CAPTURE_TRIES failures graphs are left off.'''
+        self._graphs = OrderedDict((k, g) for k, g in self._graphs.items() if g is not graph)
+        self._capture_failures += 1
+        off = self._capture_failures >= self.CAPTURE_TRIES
+        if off:
+            self.graphed_decode = False
+            self._graphs.clear()
+        logging.getLogger('manga-translator.hayai').warning(
+            f'Hayai CUDA-graph capture failed ({type(error).__name__}: {error}); decoding this batch '
+            f'eagerly' + ('; graphs are now off' if off else ', will capture again later'))
 
     @torch.no_grad()
     def generate(self, pixel_values: torch.Tensor, pixel_attention_mask: torch.Tensor,
@@ -631,7 +660,7 @@ class HayaiModel(nn.Module):
 
             graph = None
             if self.graphed_decode and device.type == 'cuda':
-                graph = self._decode_graph(b, m_vision, max_new_tokens, x.dtype, device, eos_id, pad_id)
+                graph = self._decode_graph(b, m_vision, max_new_tokens, device, eos_id, pad_id)
             kv_cache = {}
             for i, layer in enumerate(self.decoder.layers):
                 if graph is not None:   # [shiori] the prefill fills the graph's own cache
@@ -658,10 +687,8 @@ class HayaiModel(nn.Module):
             if graph is not None:
                 try:
                     graph.start(next_tokens, unfinished, valid_vis, m_vision)
-                except Exception as e:  # capture unsupported here: decode eagerly from now on
-                    warnings.warn(f'Hayai CUDA-graph decoding disabled ({type(e).__name__}: {e})')
-                    self.graphed_decode = False
-                    self._graphs.clear()
+                except Exception as e:
+                    self._capture_failed(graph, e)
                     graph = None
             if graph is not None:
                 graph.decode(generated_tokens, max_new_tokens)
