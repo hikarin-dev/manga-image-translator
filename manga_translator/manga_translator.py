@@ -2240,9 +2240,10 @@ class MangaTranslator:
                 soft_tokens = max(2000, min(12000, int(hard_in * 0.75)))
             except Exception:
                 adaptive = False
-        ADAPTIVE_FIRST_PAGES = 3   # start-fast trigger only (NOT a size cap): the first request
+        ADAPTIVE_FIRST_PAGES = 1   # start-fast trigger only (NOT a size cap): the first request
                                    # fires after this many pages even if still under the token
-                                   # target, so a sparse gallery still starts the pipeline promptly
+                                   # target. One page: the first page is translated as soon as it
+                                   # is read, so it comes back sooner; later requests still batch
         ADAPTIVE_TAIL_PAGES = 4    # within this many pages of the end, lower the token target so
                                    # the final request is small (cuts the pure-network tail)
         ADAPTIVE_MAX_PAGES = cap   # HARD page ceiling per request — required for correctness, not
