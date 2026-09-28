@@ -12,10 +12,14 @@ is upstream `modeling_hayai.py` with two deliberate deviations, marked [shiori]:
   - no transformers PreTrainedModel/config plumbing;
   - batched generation masks the zero-padded vision tokens of shorter images
     (upstream leaves them attendable), so a crop reads the same whether it is
-    decoded alone or in a batch.
+    decoded alone or in a batch;
+  - on CUDA the decode steps replay as captured CUDA graphs (_DecodeGraph).
 '''
 
 import math
+import os
+import warnings
+from collections import OrderedDict
 from functools import lru_cache
 from typing import List, Tuple
 
@@ -391,6 +395,22 @@ class GroupedQueryAttention(nn.Module):
 
         return self.w_o(context.transpose(1, 2).contiguous().view(b, s, -1))
 
+    def step(self, x, cos, sin, k_cache, v_cache, pos, mask):
+        '''[shiori] One decode position for a captured graph: this token's key and value go to the
+        cache at `pos` (a 1-element device tensor, so one graph serves every position) and the
+        query attends over the whole fixed-length cache under `mask`.'''
+        b = x.size(0)
+        q = self.q_norm(self.w_q(x).view(b, 1, self.h_q, self.d_head))
+        k = self.k_norm(self.w_k(x).view(b, 1, self.h_kv, self.d_head))
+        v = self.w_v(x).view(b, 1, self.h_kv, self.d_head)
+        q = apply_rotary_emb_2d(q, cos, sin)
+        k = apply_rotary_emb_2d(k, cos, sin)
+        k_cache.index_copy_(2, pos, k.transpose(1, 2).to(k_cache.dtype))
+        v_cache.index_copy_(2, pos, v.transpose(1, 2).to(v_cache.dtype))
+        context = F.scaled_dot_product_attention(q.transpose(1, 2), k_cache, v_cache, attn_mask=mask,
+                                                 dropout_p=0.0, is_causal=False, enable_gqa=True)
+        return self.w_o(context.transpose(1, 2).contiguous().view(b, 1, -1))
+
 
 class DecoderLayer(nn.Module):
     def __init__(self, d_model: int, h_q: int, h_kv: int, d_ffn: int):
@@ -409,6 +429,12 @@ class DecoderLayer(nn.Module):
             self.attn_norm(x), mask=mask, cos_sin=cos_sin,
             kv_cache=kv_cache, layer_idx=layer_idx, cache_seqlens=cache_seqlens
         )
+        x = x + self.ffn_res_scale * self.ffn(self.ffn_norm(x))
+        return x
+
+    def step(self, x, cos, sin, k_cache, v_cache, pos, mask):
+        '''[shiori] forward() for one decode position of a captured graph (see attention step).'''
+        x = x + self.attn_res_scale * self.attn.step(self.attn_norm(x), cos, sin, k_cache, v_cache, pos, mask)
         x = x + self.ffn_res_scale * self.ffn(self.ffn_norm(x))
         return x
 
@@ -441,6 +467,97 @@ class VisualCausalOCRDecoder(nn.Module):
         return self._mask_cache[key]
 
 
+class _DecodeGraph:
+    '''[shiori] Greedy decode steps replayed as one captured CUDA graph each.
+
+    Eagerly a step is ~500 small kernels launched from Python, and on Windows the launches cost
+    more than the work, so decoding is launch-bound. Here one step (embed, 12 layers, head,
+    argmax, bookkeeping) is captured once per padded batch size and cache length, then
+    replayed: one launch per step. Shapes must stay fixed for that, so the cache has a fixed
+    length, the position lives on the device, and a mask hides the slots not written yet. The
+    step computes what the eager loop computes; attending over the fixed length (masked) instead
+    of the written prefix can round differently in the last bits.'''
+
+    GRAPHS_KEPT = 16
+
+    def __init__(self, model, batch, length, dtype, device, max_new_tokens, eos_id, pad_id):
+        attn = model.decoder.layers[0].attn
+        shape = (batch, attn.h_kv, length, attn.d_head)
+        self.model, self.batch, self.length = model, batch, length
+        self.eos_id, self.pad_id = eos_id, pad_id
+        self.k = [torch.zeros(shape, dtype=dtype, device=device) for _ in model.decoder.layers]
+        self.v = [torch.zeros(shape, dtype=dtype, device=device) for _ in model.decoder.layers]
+        self.tok = torch.zeros(batch, dtype=torch.long, device=device)
+        self.out = torch.zeros(batch, dtype=torch.long, device=device)
+        self.unfinished = torch.zeros(batch, dtype=torch.bool, device=device)
+        self.pos = torch.zeros(1, dtype=torch.long, device=device)
+        self.idx = torch.zeros(1, dtype=torch.long, device=device)
+        self.mask = torch.zeros((batch, 1, 1, length), dtype=torch.float32, device=device)
+        d_axis = 32
+        freqs = 1.0 / (10000.0 ** (torch.arange(0, d_axis, 2, device=device).float() / d_axis))
+        t_text_all = torch.arange(max_new_tokens + 1, device=device, dtype=torch.float32)
+        text_freqs_all = torch.cat([torch.outer(t_text_all, freqs), torch.outer(t_text_all, freqs)], dim=-1)
+        self.cos, self.sin = torch.cos(text_freqs_all), torch.sin(text_freqs_all)
+        self.graph = None
+
+    def _step(self):
+        dec = self.model.decoder
+        # Weight-cast caching is incompatible with capture; the casts become part of the graph.
+        with torch.autocast(device_type='cuda', dtype=torch.float16, cache_enabled=False):
+            x = dec.token_embeddings(self.tok.unsqueeze(1))
+            cos = self.cos.index_select(0, self.idx).expand(self.batch, 1, -1)
+            sin = self.sin.index_select(0, self.idx).expand(self.batch, 1, -1)
+            self.mask.index_fill_(3, self.pos, 0.0)
+            for i, layer in enumerate(dec.layers):
+                x = layer.step(x, cos, sin, self.k[i], self.v[i], self.pos, self.mask)
+            logits = dec.output_head(dec.final_norm(x))[:, -1, :]
+            nxt = torch.argmax(logits, dim=-1) * self.unfinished + self.pad_id * (~self.unfinished)
+        self.out.copy_(nxt)
+        self.unfinished.copy_(self.unfinished & (nxt != self.eos_id) & (nxt != self.pad_id))
+        self.tok.copy_(nxt)
+        self.pos.add_(1)
+        self.idx.add_(1)
+
+    def start(self, next_tokens, unfinished, valid_vis, m_vision):
+        '''Load the state the prefill left (it wrote this graph's cache directly) and capture on
+        first use. Rows past the real batch attend one slot so their math stays finite.'''
+        b = next_tokens.size(0)
+        self.tok.fill_(self.pad_id)
+        self.tok[:b] = next_tokens
+        self.unfinished.zero_()
+        self.unfinished[:b] = unfinished
+        self.pos.fill_(m_vision + 1)
+        self.idx.fill_(1)
+        self.mask.fill_(-1e9)
+        self.mask[:, 0, 0, 0] = 0.0
+        slots = torch.arange(self.length, device=self.mask.device)
+        self.mask[:b, 0, 0, :].masked_fill_(slots[None, :] < valid_vis[:, None], 0.0)
+        self.mask[:b, 0, 0, m_vision] = 0.0     # the bos token
+        if self.graph is None:
+            saved = [t.clone() for t in (self.tok, self.unfinished, self.pos, self.idx, self.mask)]
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):          # warm-up before capture, as CUDA graphs require
+                for _ in range(2):
+                    self._step()
+            torch.cuda.current_stream().wait_stream(side)
+            for t, value in zip((self.tok, self.unfinished, self.pos, self.idx, self.mask), saved):
+                t.copy_(value)                     # slots the warm-up wrote are rewritten before read
+            graph = torch.cuda.CUDAGraph()
+            # thread_local: the other GPU lanes keep launching work while this lane captures.
+            with torch.cuda.graph(graph, capture_error_mode='thread_local'):
+                self._step()
+            self.graph = graph
+
+    def decode(self, generated_tokens, max_new_tokens):
+        b = generated_tokens.size(0)
+        for step in range(1, max_new_tokens):
+            if not self.unfinished[:b].any():
+                break
+            self.graph.replay()
+            generated_tokens[:, step + 1] = self.out[:b]
+
+
 class HayaiModel(nn.Module):
     def __init__(self, vocab_size: int = 16004, d_model: int = 512, d_vision: int = 768,
                  d_ffn: int = 2048, n_layers: int = 12):
@@ -448,6 +565,23 @@ class HayaiModel(nn.Module):
         self.vision_encoder = Siglip2VisionModel()
         self.decoder = VisualCausalOCRDecoder(vocab_size=vocab_size, d_model=d_model, d_vision=d_vision,
                                               d_ffn=d_ffn, n_layers=n_layers)
+        # [shiori] CUDA-graph decoding (_DecodeGraph); MT_HAYAI_GRAPHS=0 turns it off.
+        self.graphed_decode = os.environ.get('MT_HAYAI_GRAPHS', '1') != '0'
+        self._graphs = OrderedDict()
+
+    def _decode_graph(self, b, m_vision, max_new_tokens, dtype, device, eos_id, pad_id):
+        '''The graph for this batch, padded to a power of two, and cache length, bucketed by 64.'''
+        batch = 1 << (b - 1).bit_length()
+        length = -(-(m_vision + 1) // 64) * 64 + max_new_tokens
+        key = (batch, length, dtype, max_new_tokens, eos_id, pad_id)
+        graph = self._graphs.get(key)
+        if graph is None:
+            graph = self._graphs[key] = _DecodeGraph(self, batch, length, dtype, device, max_new_tokens,
+                                                     eos_id, pad_id)
+            while len(self._graphs) > _DecodeGraph.GRAPHS_KEPT:
+                self._graphs.popitem(last=False)
+        self._graphs.move_to_end(key)
+        return graph
 
     @torch.no_grad()
     def generate(self, pixel_values: torch.Tensor, pixel_attention_mask: torch.Tensor,
@@ -495,8 +629,14 @@ class HayaiModel(nn.Module):
             cos_text_all = torch.cos(text_freqs_all)
             sin_text_all = torch.sin(text_freqs_all)
 
+            graph = None
+            if self.graphed_decode and device.type == 'cuda':
+                graph = self._decode_graph(b, m_vision, max_new_tokens, x.dtype, device, eos_id, pad_id)
             kv_cache = {}
             for i, layer in enumerate(self.decoder.layers):
+                if graph is not None:   # [shiori] the prefill fills the graph's own cache
+                    kv_cache[i] = (graph.k[i][:b, :, :max_seq_len], graph.v[i][:b, :, :max_seq_len])
+                    continue
                 k_cache = torch.zeros((b, layer.attn.h_kv, max_seq_len, layer.attn.d_head), dtype=x.dtype, device=device)
                 v_cache = torch.zeros((b, layer.attn.h_kv, max_seq_len, layer.attn.d_head), dtype=x.dtype, device=device)
                 kv_cache[i] = (k_cache, v_cache)
@@ -515,6 +655,29 @@ class HayaiModel(nn.Module):
             generated_tokens[:, 1] = next_tokens
             unfinished = (next_tokens != eos_id) & (next_tokens != pad_id)
 
+            if graph is not None:
+                try:
+                    graph.start(next_tokens, unfinished, valid_vis, m_vision)
+                except Exception as e:  # capture unsupported here: decode eagerly from now on
+                    warnings.warn(f'Hayai CUDA-graph decoding disabled ({type(e).__name__}: {e})')
+                    self.graphed_decode = False
+                    self._graphs.clear()
+                    graph = None
+            if graph is not None:
+                graph.decode(generated_tokens, max_new_tokens)
+            else:
+                self._decode_eager(next_tokens, unfinished, generated_tokens, kv_cache, cache_seqlens,
+                                   step_pad, cos_text_all, sin_text_all, eos_id, pad_id, max_new_tokens)
+
+        return [[t for t in seq.tolist()[1:] if t not in (eos_id, pad_id)] for seq in generated_tokens]
+
+    def _decode_eager(self, next_tokens, unfinished, generated_tokens, kv_cache, cache_seqlens, step_pad,
+                      cos_text_all, sin_text_all, eos_id, pad_id, max_new_tokens):
+        '''The upstream decode loop, unchanged, for when no CUDA graph is used.'''
+        b = next_tokens.size(0)
+        device = next_tokens.device
+        with torch.autocast(device_type=device.type, dtype=torch.float16 if device.type == "cuda" else torch.float32,
+                            enabled=(device.type == "cuda")):
             for step in range(1, max_new_tokens):
                 if not unfinished.any(): break
                 x_step = self.decoder.token_embeddings(next_tokens.unsqueeze(1))
@@ -531,5 +694,3 @@ class HayaiModel(nn.Module):
                 next_tokens = torch.argmax(logits_step, dim=-1) * unfinished + pad_id * (~unfinished)
                 generated_tokens[:, step+1] = next_tokens
                 unfinished = unfinished & (next_tokens != eos_id) & (next_tokens != pad_id)
-
-        return [[t for t in seq.tolist()[1:] if t not in (eos_id, pad_id)] for seq in generated_tokens]
