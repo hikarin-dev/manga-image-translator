@@ -108,10 +108,13 @@ class Sampler(threading.Thread):
 # ── jobs ──────────────────────────────────────────────────────────────────────────────────────
 def corpus_pages(n: int, galleries: list[str] | None, spread: bool = False, samples: bool = False) -> list[Path]:
     """`n` pages in corpus order (cycling), or with `spread` evenly spaced across it. `samples`
-    keeps only the pages the Settings benchmark measured (20 per benchmark gallery)."""
+    keeps only the pages the Settings benchmark measured (20 per benchmark gallery). Galleries
+    marked `extra` in the index are used only when named, so adding one leaves the default page
+    selection, and every reference run made with it, unchanged."""
     index = json.loads((CORPUS / 'index.json').read_text())
     files = [CORPUS / r['file'] for r in index
-             if (not galleries or r['gallery'] in galleries) and (not samples or r['benchmark_sample'])]
+             if (r['gallery'] in galleries if galleries else not r.get('extra'))
+             and (not samples or r['benchmark_sample'])]
     if not files:
         sys.exit('no corpus pages; see dev/corpus-benchmark')
     if spread and n <= len(files):
