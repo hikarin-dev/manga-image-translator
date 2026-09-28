@@ -309,10 +309,12 @@ async def start_gallery(req: Request, image: list[UploadFile] = File(...), stage
         rejected = edge.check_admission(client_ip, len(images))
         if rejected:
             raise HTTPException(rejected[0], detail=rejected[1])
-    # Nothing can run this job: --delegate-only with no aux node connected, or the local worker
-    # died. Refuse now with a message the client can show, rather than accepting a job that
-    # would sit at 0% until the starvation guard eventually errors it.
-    if executor_instances.capacity(gallery=True) == 0:
+    # Nothing can run this job: --delegate-only with no aux node connected. Refuse now with a
+    # message the client can show, rather than accepting a job that would sit at 0% until the
+    # starvation guard eventually errors it. A supervised local worker that is out of the pool is
+    # restarting (recycled for memory, or respawning after a crash) and seconds from back, so
+    # the job queues for it like a chunk does (myqueue.NO_EXECUTOR_TIMEOUT_S).
+    if executor_instances.capacity(gallery=True) == 0 and not _local_worker:
         raise HTTPException(503, detail="no translation capacity is connected right now — try again shortly")
     return await start_gallery_job(req, transform_gallery_summary, conf, images, batch_size, job_token, source_url,
                                    pages=page_data, builds=builds or None, context=prior, capture=capture)

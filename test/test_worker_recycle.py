@@ -54,3 +54,25 @@ def test_untrimmed_report_is_not_judged(monkeypatch):
         assert not main._local_worker.get('recycle')
     finally:
         executor_instances.unregister(inst)
+
+
+def test_a_job_started_while_the_local_worker_restarts_waits_for_it(monkeypatch):
+    """A recycle or crash restart leaves the pool empty for seconds; a job arriving then queues
+    instead of being refused. Only a server with no local worker at all says there's no capacity."""
+    import io
+    from fastapi.testclient import TestClient
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new('RGB', (8, 8)).save(buf, 'PNG')
+
+    async def start(*args, **kwargs):
+        return {'token': 'x', 'started': True}
+    monkeypatch.setattr(main, 'start_gallery_job', start)
+    monkeypatch.setattr(main.executor_instances, 'capacity', lambda gallery=False: 0)
+    client = TestClient(main.app, client=('127.0.0.1', 5555))
+    post = lambda: client.post('/translate/gallery/start', data={'job_token': 'x'},
+                               files=[('image', ('p.png', buf.getvalue(), 'image/png'))])
+    monkeypatch.setattr(main, '_local_worker', {'recycle': True})
+    assert post().status_code == 200
+    monkeypatch.setattr(main, '_local_worker', {})
+    assert post().status_code == 503
