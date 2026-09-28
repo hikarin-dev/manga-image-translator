@@ -580,7 +580,7 @@ class HayaiModel(nn.Module):
         self._graphs = OrderedDict()
         self._capture_failures = 0
 
-    CAPTURE_TRIES = 3
+    CAPTURE_TRIES = 5   # consecutive failed captures before graphs are left off
 
     def _decode_graph(self, b, m_vision, max_new_tokens, device, eos_id, pad_id):
         '''The graph for this batch, padded to a power of two, and cache length, bucketed by 64.
@@ -599,9 +599,18 @@ class HayaiModel(nn.Module):
         return graph
 
     def _capture_failed(self, graph, error):
-        '''A capture fails when something else on the GPU interrupts it (another lane freeing
-        cached memory, say). This page decodes eagerly; the graph is captured afresh on a later
-        call, and after CAPTURE_TRIES failures graphs are left off.'''
+        '''A capture fails when something else on the GPU interrupts it (another lane or the
+        translator freeing memory, say). This batch decodes eagerly; the graph is captured afresh
+        on a later call, and after CAPTURE_TRIES failures in a row graphs are left off.'''
+        # The failed capture leaves its CUDA error pending on this thread, and the next kernel
+        # launch would report it: consume it with a throwaway launch before the eager decode.
+        device = next(self.parameters()).device
+        for _ in range(3):
+            try:
+                torch.zeros(1, device=device).add_(1)
+                break
+            except Exception:
+                continue
         self._graphs = OrderedDict((k, g) for k, g in self._graphs.items() if g is not graph)
         self._capture_failures += 1
         off = self._capture_failures >= self.CAPTURE_TRIES
@@ -687,6 +696,7 @@ class HayaiModel(nn.Module):
             if graph is not None:
                 try:
                     graph.start(next_tokens, unfinished, valid_vis, m_vision)
+                    self._capture_failures = 0
                 except Exception as e:
                     self._capture_failed(graph, e)
                     graph = None

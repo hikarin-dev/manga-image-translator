@@ -42,18 +42,19 @@ def test_a_failed_capture_decodes_eagerly_and_is_retried_later(monkeypatch):
         assert model.graphed_decode and not model._graphs, 'one failure only drops that graph'
         for _ in range(HayaiModel.CAPTURE_TRIES - 1):
             assert model.generate(*args) == expected
-        assert model.graphed_decode is False, 'repeated failures turn graphs off'
+        assert model.graphed_decode is False, 'failures in a row turn graphs off'
 
 
 def test_a_capture_interrupted_mid_way_leaves_this_thread_able_to_decode(monkeypatch):
-    """The failure that lost a page: torch.cuda.graph() left the broken capture stream current,
-    so the eager fallback failed too."""
+    """The failure that lost a page: an invalidated capture leaves its CUDA error pending on the
+    thread (and torch.cuda.graph() would leave the capture stream current), so the eager
+    fallback's first launch failed too. A device sync mid-capture invalidates it for real."""
     model, args = model_and_inputs()
     step = _DecodeGraph._step
 
     def interrupted(self):
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError('interrupted capture')
+            torch.cuda.synchronize()
         return step(self)
     with torch.inference_mode():
         expected = eager(model, args)
